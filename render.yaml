@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: woom-audio-mixer
+    env: docker
+    plan: free
+    region: oregon # Or your preferred region
+    healthCheckPath: /
+    dockerContext: .
+    dockerfilePath: ./Dockerfile

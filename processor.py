@@ -1,0 +1,276 @@
+import subprocess
+import os
+import tempfile
+import librosa
+from pydub import AudioSegment
+import numpy as np
+from scipy import signal
+import soundfile as sf
+
+def calculate_duration_from_analysis(picked_audio, num_beats=4):
+    """Phân tích file để lấy duration chính xác cho N nhịp tim."""
+    try:
+        y, sr = librosa.load(picked_audio, sr=None)
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+        if isinstance(tempo, np.ndarray):
+            tempo = float(tempo[0]) if tempo.size > 0 else 120.0
+        if len(beats) >= num_beats + 1:
+            duration = librosa.frames_to_time(beats[num_beats] - beats[0], sr=sr)
+            return duration, tempo
+    except Exception as e:
+        print(f"❌ Phân tích thất bại: {e}")
+    return None, 120.0
+
+def detect_tempo(audio_path):
+    """Tự detect tempo của file audio dùng Librosa."""
+    try:
+        y, sr = librosa.load(audio_path, sr=None)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        if isinstance(tempo, np.ndarray):
+            tempo = float(tempo[0]) if tempo.size > 0 else 120.0
+        return tempo
+    except Exception as e:
+        print(f"❌ Detect tempo thất bại: {e}")
+        return 120.0
+
+def get_mean_volume(audio_path):
+    """Đo mean volume (dBFS) dùng PyDub."""
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        return audio.dBFS
+    except Exception as e:
+        print(f"❌ Đo volume thất bại: {e}")
+        return -16.0
+
+def run_ffmpeg(command):
+    """Chạy FFmpeg command và check success."""
+    process = subprocess.run(command, shell=True, capture_output=True, text=True)
+    if process.returncode != 0:
+        print(f"❌ FFmpeg failed: {process.stderr}")
+        return False
+    return True
+
+def apply_noise_reduction(y, sr):
+    """Sử dụng HPSS từ Librosa để tách percussive (nhịp tim)."""
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+    return y_percussive
+
+def tune_to_432hz(input_path, output_path):
+    """Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz."""
+    y, sr = librosa.load(input_path, sr=None)
+    n_steps = 12 * np.log2(432 / 440)  # ≈ -0.3176 semitones
+    y_tuned = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
+    sf.write(output_path, y_tuned, sr)
+
+def time_stretch_heartbeat(input_path, output_path, target_tempo, original_tempo):
+    """Stretch nhịp tim dùng FFmpeg atempo."""
+    if original_tempo <= 0 or target_tempo <= 0:
+        run_ffmpeg(f'ffmpeg -y -i "{input_path}" "{output_path}"')
+        return
+
+    rate = target_tempo / original_tempo
+    if rate <= 0 or np.isinf(rate) or np.isnan(rate):
+        rate = 1.0
+    
+    # Cap rate for stability
+    rate = max(0.3, min(3.0, rate))
+
+    stretch_cmd = f'ffmpeg -y -i "{input_path}" -filter:a "atempo={rate}" "{output_path}"'
+    if not run_ffmpeg(stretch_cmd):
+        run_ffmpeg(f'ffmpeg -y -i "{input_path}" "{output_path}"')
+
+def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120):
+    """Version 1: Basic mixing with volume balancing and trimming."""
+    tempo_factor = original_bpm / target_bpm
+    duration_seconds, _ = calculate_duration_from_analysis(picked_audio)
+
+    if duration_seconds is None:
+        duration_seconds = 4 * (60.0 / original_bpm)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        filtered_path = os.path.join(temp_dir, 'picked_filtered.wav')
+        silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
+        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
+        normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
+
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 2 -ar 44100 "{temp_wav_path}"')
+
+        # Filter
+        y, sr = sf.read(temp_wav_path)
+        if y.ndim == 1: y = y[:, np.newaxis]
+        nyq = 0.5 * sr
+        low = 500 / nyq
+        b, a = signal.butter(5, low, btype='low')
+        y_filtered = signal.filtfilt(b, a, y, axis=0)
+        sf.write(filtered_path, y_filtered, sr)
+
+        # Silence remove (using named parameters for compatibility with FFmpeg 7.x)
+        run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -af silenceremove=start_periods=1:start_threshold=-40dB:detection=peak "{silenced_path}"')
+        
+        # Trim
+        run_ffmpeg(f'ffmpeg -y -i "{silenced_path}" -t {duration_seconds} "{normalized_picked_path}"')
+        
+        # Normalize Picked
+        picked_audio_seg = AudioSegment.from_file(normalized_picked_path).normalize()
+        if picked_audio_seg.dBFS < -50: picked_audio_seg += 10
+        picked_audio_seg.export(normalized_picked_path, format="wav")
+
+        # Normalize Asset
+        run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+
+        # Mix
+        vol_asset = get_mean_volume(normalized_asset_path)
+        vol_picked = get_mean_volume(normalized_picked_path)
+        diff = vol_asset - vol_picked
+        
+        if diff > 0:
+            asset_filter = f"[0:a]atempo={tempo_factor}[a0];"
+            picked_filter = f"[1:a]volume={diff}dB,aloop=loop=-1:size=2e+09[a1];"
+        else:
+            asset_filter = f"[0:a]atempo={tempo_factor},volume={abs(diff)}dB[a0];"
+            picked_filter = f"[1:a]aloop=loop=-1:size=2e+09[a1];"
+
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{picked_filter} {asset_filter} [a0][a1]amix=inputs=2:duration=first:dropout_transition=2:weights=0.6 0.4[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{output_path}"')
+
+def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120):
+    """Version 2: HPSS, dynamic threshold, tune to 432Hz."""
+    tempo_factor = original_bpm / target_bpm
+    duration_seconds, _ = calculate_duration_from_analysis(picked_audio)
+    if duration_seconds is None:
+        duration_seconds = 4 * (60.0 / original_bpm) + 0.5
+    else:
+        duration_seconds += 0.5
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
+        silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
+        trimmed_path = os.path.join(temp_dir, 'picked_trimmed.wav')
+        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
+        stretched_asset_path = os.path.join(temp_dir, 'asset_stretched.wav')
+        normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
+        mixed_temp_path = os.path.join(temp_dir, 'mixed_temp.mp3')
+
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 2 -ar 44100 "{temp_wav_path}"')
+
+        # HPSS
+        y, sr = sf.read(temp_wav_path)
+        if y.ndim > 1: y = np.mean(y, axis=1)
+        y_denoised = apply_noise_reduction(y, sr)
+        sf.write(denoised_path, y_denoised, sr)
+
+        # Dynamic Threshold (using named parameters for compatibility with FFmpeg 7.x)
+        peak_db = librosa.amplitude_to_db(np.max(np.abs(y_denoised)))
+        threshold_db = max(-50, peak_db - 30)
+        run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -af silenceremove=start_periods=1:start_threshold={threshold_db}dB:detection=peak "{silenced_path}"')
+        
+        run_ffmpeg(f'ffmpeg -y -i "{silenced_path}" -t {duration_seconds} "{trimmed_path}"')
+        
+        # Normalize Picked
+        picked_seg = AudioSegment.from_file(trimmed_path).normalize()
+        if picked_seg.dBFS < -20: picked_seg += 6
+        picked_seg.export(normalized_picked_path, format="wav")
+
+        # Asset Stretch
+        y_asset, sr_asset = librosa.load(asset_audio, sr=None)
+        y_stretched = librosa.effects.time_stretch(y_asset, rate=tempo_factor)
+        sf.write(stretched_asset_path, y_stretched, sr_asset)
+
+        run_ffmpeg(f'ffmpeg -y -i "{stretched_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+
+        # Mix
+        vol_asset = get_mean_volume(normalized_asset_path)
+        vol_picked = get_mean_volume(normalized_picked_path)
+        diff = vol_asset - vol_picked
+        asset_filter = f"[0:a]volume={max(0, -diff)}dB[a0];"
+        picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{mixed_temp_path}"')
+        tune_to_432hz(mixed_temp_path, output_path)
+
+def mix_audio_v3(asset_audio, picked_audio, output_path):
+    """Version 3: Detect tempo, stretch heartbeat to match music tempo."""
+    duration_seconds, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if duration_seconds is None:
+        duration_seconds = 4 * (60.0 / heart_tempo) + 0.5
+    music_tempo = detect_tempo(asset_audio)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
+        stretched_path = os.path.join(temp_dir, 'picked_stretched.wav')
+        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
+        normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
+
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 1 -ar 44100 "{temp_wav_path}"')
+
+        # HPSS
+        y, sr = sf.read(temp_wav_path)
+        if y.ndim > 1: y = np.mean(y, axis=1)
+        y_denoised = apply_noise_reduction(y, sr)
+        sf.write(denoised_path, y_denoised, sr)
+
+        time_stretch_heartbeat(denoised_path, stretched_path, music_tempo, heart_tempo)
+
+        # Trim & Normalize
+        picked_seg = AudioSegment.from_file(stretched_path)
+        adjusted_duration = duration_seconds * (heart_tempo / music_tempo)
+        picked_seg = picked_seg[:int(adjusted_duration * 1000)].normalize() - 14
+        picked_seg.export(normalized_picked_path, format="wav")
+
+        run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+
+        # Mix
+        vol_asset = get_mean_volume(normalized_asset_path)
+        vol_picked = get_mean_volume(normalized_picked_path)
+        diff = vol_asset - vol_picked
+        asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
+        picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{output_path}"')
+
+def mix_audio_v4(asset_audio, picked_audio, output_path):
+    """Version 4: Stretch heartbeat to 2x music tempo, 432Hz tuning."""
+    duration_seconds, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if duration_seconds is None:
+        duration_seconds = 4 * (60.0 / heart_tempo) + 0.5
+    music_tempo = detect_tempo(asset_audio)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
+        stretched_path = os.path.join(temp_dir, 'picked_stretched.wav')
+        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
+        normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
+        mixed_temp_path = os.path.join(temp_dir, 'mixed_temp.mp3')
+
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 1 -ar 44100 "{temp_wav_path}"')
+
+        # HPSS
+        y, sr = sf.read(temp_wav_path)
+        if y.ndim > 1: y = np.mean(y, axis=1)
+        y_denoised = apply_noise_reduction(y, sr)
+        sf.write(denoised_path, y_denoised, sr)
+
+        target_heartbeat_tempo = music_tempo * 2
+        time_stretch_heartbeat(denoised_path, stretched_path, target_heartbeat_tempo, heart_tempo)
+
+        # Trim & Normalize
+        picked_seg = AudioSegment.from_file(stretched_path)
+        adjusted_duration_ms = (4 * (60.0 / target_heartbeat_tempo)) * 1000
+        picked_seg = picked_seg[:int(adjusted_duration_ms)].normalize()
+        if picked_seg.dBFS < -25: picked_seg += 3
+        picked_seg.export(normalized_picked_path, format="wav")
+
+        run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+
+        # Mix
+        vol_asset = get_mean_volume(normalized_asset_path)
+        vol_picked = get_mean_volume(normalized_picked_path)
+        diff = vol_asset - vol_picked
+        asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
+        picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{mixed_temp_path}"')
+        tune_to_432hz(mixed_temp_path, output_path)
