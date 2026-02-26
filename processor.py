@@ -58,6 +58,43 @@ def run_ffmpeg(command):
         return False
     return True
 
+
+def adjust_bpm(input_path: str, output_path: str, speed_mode: str):
+    """Adjust playback speed of an audio file using FFmpeg's atempo filter.
+
+    The `speed_mode` may be one of the named presets or a numeric factor (as
+    a string). Presets are:
+        * "Slow"  -> 0.8
+        * "Normal" -> 1.0
+        * "Fast"  -> 1.2
+
+    Any other value will be parsed as a float and clipped to a sane range.
+    """
+    speed_map = {
+        'Slow': 0.8,
+        'Normal': 1.0,
+        'Fast': 1.2,
+    }
+
+    # resolve factor
+    try:
+        speed = speed_map.get(speed_mode, float(speed_mode))
+    except Exception:
+        speed = 1.0
+
+    # clamp to avoid crazy atempo values (FFmpeg allows 0.5-2.0 per filter, but
+    # chaining is expensive; we allow a wider overall range here and let
+    # FFmpeg decide internally.)
+    if speed <= 0 or speed is None or isinstance(speed, complex):
+        speed = 1.0
+    speed = max(0.1, min(10.0, speed))
+
+    print(f"Adjusting BPM: Mode='{speed_mode}', Factor={speed}")
+    cmd = f'ffmpeg -y -i "{input_path}" -af "atempo={speed}" "{output_path}"'
+    if not run_ffmpeg(cmd):
+        # copy through if atempo fails
+        run_ffmpeg(f'ffmpeg -y -i "{input_path}" "{output_path}"')
+
 def apply_noise_reduction(y, sr):
     """Sử dụng HPSS từ Librosa để tách percussive (nhịp tim)."""
     y_harmonic, y_percussive = librosa.effects.hpss(y)

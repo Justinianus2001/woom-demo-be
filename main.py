@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
@@ -6,7 +6,8 @@ import os
 import tempfile
 import zipfile
 import logging
-from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4
+from typing import List
+from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm, adjust_bpm
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -106,6 +107,46 @@ def mix_all(
     except Exception as e:
         logger.error(f"Global error in /mix-all: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/adjust-bpm")
+def adjust_bpm_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    speeds: List[str] = Form(...)
+):
+    """
+    Accept a single audio file and one or more speed modes, then return a ZIP
+    containing files adjusted by the requested tempo factors. The client will
+    send the mix generated previously along with either `Slow`, `Normal` or
+    `Fast` (or any custom factor) values.
+    """
+    temp_dir = tempfile.mkdtemp()
+    background_tasks.add_task(cleanup_temp, temp_dir)
+
+    # save incoming file
+    input_path = os.path.join(temp_dir, "input_mix.mp3")
+    with open(input_path, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+
+    zip_path = os.path.join(temp_dir, "bpm_adjusted.zip")
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for speed in speeds:
+            safe = "".join(c for c in speed if c.isalnum() or c in "._-")
+            if not safe:
+                continue
+            out_name = f"{safe}.mp3"
+            out_path = os.path.join(temp_dir, out_name)
+            try:
+                adjust_bpm(input_path, out_path, speed)
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    zipf.write(out_path, out_name)
+                    logger.info(f"Created adjusted file for {speed}")
+                else:
+                    logger.warning(f"adjust_bpm produced no output for {speed}")
+            except Exception as e:
+                logger.error(f"Error adjusting bpm ({speed}): {e}")
+    return FileResponse(zip_path, media_type="application/zip", filename="bpm_adjusted.zip")
+
 
 @app.get("/")
 async def health_check():
