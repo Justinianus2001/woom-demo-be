@@ -1,26 +1,55 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import os
 import tempfile
 import zipfile
+import logging
 from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Woom Audio Mixer API")
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def cleanup_temp(temp_dir: str):
+    """Safely remove the temporary directory."""
+    try:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.info(f"Cleaned up temporary directory: {temp_dir}")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
 @app.post("/mix-all")
-async def mix_all(
+def mix_all(
+    background_tasks: BackgroundTasks,
     asset: UploadFile = File(...),
     picked: UploadFile = File(...)
 ):
     """
     Inputs two audio files (asset and picked) and returns a ZIP file with 4 mixed versions.
     """
-    # Create a temporary directory to store files
     temp_dir = tempfile.mkdtemp()
+    background_tasks.add_task(cleanup_temp, temp_dir)
+    
     try:
-        asset_path = os.path.join(temp_dir, asset.filename)
-        picked_path = os.path.join(temp_dir, picked.filename)
+        # Sanitize filenames for path joining
+        asset_filename = "".join([c for c in asset.filename if c.isalnum() or c in "._-"])
+        picked_filename = "".join([c for c in picked.filename if c.isalnum() or c in "._-"])
+        
+        asset_path = os.path.join(temp_dir, f"asset_{asset_filename}")
+        picked_path = os.path.join(temp_dir, f"picked_{picked_filename}")
 
         # Save uploaded files
         with open(asset_path, "wb") as buffer:
@@ -29,47 +58,53 @@ async def mix_all(
             shutil.copyfileobj(picked.file, buffer)
 
         # Define output paths
-        v1_out = os.path.join(temp_dir, "v1_mixed.mp3")
-        v2_out = os.path.join(temp_dir, "v2_mixed.mp3")
-        v3_out = os.path.join(temp_dir, "v3_mixed.mp3")
-        v4_out = os.path.join(temp_dir, "v4_mixed.mp3")
-
-        # Run the 4 mixing methods
-        try:
-            mix_audio_v1(asset_path, picked_path, v1_out)
-        except Exception as e:
-            print(f"Error in v1: {e}")
-            
-        try:
-            mix_audio_v2(asset_path, picked_path, v2_out)
-        except Exception as e:
-            print(f"Error in v2: {e}")
-            
-        try:
-            mix_audio_v3(asset_path, picked_path, v3_out)
-        except Exception as e:
-            print(f"Error in v3: {e}")
-            
-        try:
-            mix_audio_v4(asset_path, picked_path, v4_out)
-        except Exception as e:
-            print(f"Error in v4: {e}")
-
-        # Zip the results
+        outputs = {
+            "v1_mixed.mp3": mix_audio_v1,
+            "v2_mixed.mp3": mix_audio_v2,
+            "v3_mixed.mp3": mix_audio_v3,
+            "v4_mixed.mp3": mix_audio_v4
+        }
+        
+        # Results storage
         zip_path = os.path.join(temp_dir, "mixed_versions.zip")
+        any_success = False
+
+        import concurrent.futures
         with zipfile.ZipFile(zip_path, 'w') as zipf:
-            for out_file in [v1_out, v2_out, v3_out, v4_out]:
-                if os.path.exists(out_file):
-                    zipf.write(out_file, os.path.basename(out_file))
+            # Using ThreadPoolExecutor with lower workers prevents Out-Of-Memory (OOM) 
+            # and fork/OpenBLAS segment faults that abruptly kill processes.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {}
+                for filename, mix_func in outputs.items():
+                    out_path = os.path.join(temp_dir, filename)
+                    logger.info(f"Dispatching {filename}...")
+                    futures[executor.submit(mix_func, asset_path, picked_path, out_path)] = filename
+                
+                for future in concurrent.futures.as_completed(futures):
+                    filename = futures[future]
+                    out_path = os.path.join(temp_dir, filename)
+                    try:
+                        future.result()
+                        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                            zipf.write(out_path, filename)
+                            any_success = True
+                            logger.info(f"Successfully added {filename} to zip.")
+                        else:
+                            logger.warning(f"File {filename} was not created or is empty.")
+                    except Exception as e:
+                        logger.error(f"Error creating {filename}: {e}")
 
-        if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
-            raise HTTPException(status_code=500, detail="Failed to generate any mixed files.")
+        if not any_success:
+            raise HTTPException(status_code=500, detail="All mixing methods failed. Please check if FFmpeg is installed and files are valid.")
 
-        return FileResponse(zip_path, media_type="application/zip", filename="mixed_versions.zip")
+        return FileResponse(
+            zip_path, 
+            media_type="application/zip", 
+            filename="mixed_versions.zip"
+        )
 
     except Exception as e:
-        # Cleanup on error
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.error(f"Global error in /mix-all: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")

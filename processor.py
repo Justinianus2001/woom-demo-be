@@ -11,9 +11,13 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
     """Phân tích file để lấy duration chính xác cho N nhịp tim."""
     try:
         y, sr = librosa.load(picked_audio, sr=None)
+        if len(y) == 0:
+            return None, 120.0
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-        if isinstance(tempo, np.ndarray):
-            tempo = float(tempo[0]) if tempo.size > 0 else 120.0
+        if hasattr(tempo, "__len__"): # Handle cases where tempo might be an array
+            tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
+        else:
+            tempo = float(tempo)
         if len(beats) >= num_beats + 1:
             duration = librosa.frames_to_time(beats[num_beats] - beats[0], sr=sr)
             return duration, tempo
@@ -25,9 +29,13 @@ def detect_tempo(audio_path):
     """Tự detect tempo của file audio dùng Librosa."""
     try:
         y, sr = librosa.load(audio_path, sr=None)
+        if len(y) == 0:
+            return 120.0
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        if isinstance(tempo, np.ndarray):
-            tempo = float(tempo[0]) if tempo.size > 0 else 120.0
+        if hasattr(tempo, "__len__"):
+            tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
+        else:
+            tempo = float(tempo)
         return tempo
     except Exception as e:
         print(f"❌ Detect tempo thất bại: {e}")
@@ -102,14 +110,22 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         nyq = 0.5 * sr
         low = 500 / nyq
         b, a = signal.butter(5, low, btype='low')
-        y_filtered = signal.filtfilt(b, a, y, axis=0)
+        padlen = 3 * (max(len(b), len(a)) - 1)
+        if y.shape[0] > padlen:
+            y_filtered = signal.filtfilt(b, a, y, axis=0)
+        else:
+            y_filtered = y
+        if len(y_filtered.shape) == 2 and y_filtered.shape[1] == 1:
+            y_filtered = y_filtered.squeeze()
         sf.write(filtered_path, y_filtered, sr)
 
         # Silence remove (using named parameters for compatibility with FFmpeg 7.x)
-        run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -af silenceremove=start_periods=1:start_threshold=-40dB:detection=peak "{silenced_path}"')
+        run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -af silenceremove=start_periods=1:start_duration=0:start_threshold=-40dB:detection=peak "{silenced_path}"')
         
         # Trim
         run_ffmpeg(f'ffmpeg -y -i "{silenced_path}" -t {duration_seconds} "{normalized_picked_path}"')
+        if not os.path.exists(normalized_picked_path) or os.path.getsize(normalized_picked_path) == 0:
+            run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -t {duration_seconds} "{normalized_picked_path}"')
         
         # Normalize Picked
         picked_audio_seg = AudioSegment.from_file(normalized_picked_path).normalize()
@@ -161,11 +177,17 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         sf.write(denoised_path, y_denoised, sr)
 
         # Dynamic Threshold (using named parameters for compatibility with FFmpeg 7.x)
-        peak_db = librosa.amplitude_to_db(np.max(np.abs(y_denoised)))
-        threshold_db = max(-50, peak_db - 30)
-        run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -af silenceremove=start_periods=1:start_threshold={threshold_db}dB:detection=peak "{silenced_path}"')
+        max_val = np.max(np.abs(y_denoised)) if len(y_denoised) > 0 else 0
+        if max_val > 0:
+            peak_db = librosa.amplitude_to_db(max_val)
+            threshold_db = max(-50, peak_db - 30)
+        else:
+            threshold_db = -50
+        run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -af silenceremove=start_periods=1:start_duration=0:start_threshold={threshold_db}dB:detection=peak "{silenced_path}"')
         
         run_ffmpeg(f'ffmpeg -y -i "{silenced_path}" -t {duration_seconds} "{trimmed_path}"')
+        if not os.path.exists(trimmed_path) or os.path.getsize(trimmed_path) == 0:
+            run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -t {duration_seconds} "{trimmed_path}"')
         
         # Normalize Picked
         picked_seg = AudioSegment.from_file(trimmed_path).normalize()
@@ -272,5 +294,5 @@ def mix_audio_v4(asset_audio, picked_audio, output_path):
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
 
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{mixed_temp_path}"')
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.75 0.25[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{mixed_temp_path}"')
         tune_to_432hz(mixed_temp_path, output_path)

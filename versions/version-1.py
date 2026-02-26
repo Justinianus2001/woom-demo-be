@@ -165,4 +165,4 @@ def mix_audio(asset_audio, picked_audio, output_path, original_bpm=120, target_b
             print("❌ Mixing failed")
 
 # Usage example (thay bằng paths thực tế)
-mix_audio("twinkle_star.mp3", "Heartbeat5_bpm140.wav", "demo_version_1.mp3")
+mix_audio("twinkle_star.mp3", "Heartbeat5_bpm140.wav", "version_1.mp3")

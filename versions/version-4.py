@@ -150,8 +150,8 @@ def mix_audio_v4(asset_audio, picked_audio, output_path):
         if not run_ffmpeg(normalize_asset_cmd):
             return
 
-        # Bước 6: Mix với tỉ lệ mới 0.8 (nhạc) : 0.2 (tim)
-        print("🎵 Bước 6: Mix với tỉ lệ 0.8:0.2 (nhạc : tim) và cân bằng âm lượng...")
+        # Bước 6: Mix với tỉ lệ mới 0.75 (nhạc) : 0.25 (tim)
+        print("🎵 Bước 6: Mix với tỉ lệ 0.75:0.25 (nhạc : tim) và cân bằng âm lượng...")
         vol_asset = get_mean_volume(normalized_asset_path)
         vol_picked = get_mean_volume(normalized_picked_path)
         print(f"📊 Volumes → Asset: {vol_asset:.2f} dB, Picked: {vol_picked:.2f} dB")
@@ -166,7 +166,7 @@ def mix_audio_v4(asset_audio, picked_audio, output_path):
 
         mix_cmd = (
             f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" '
-            f'-filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" '
+            f'-filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.75 0.25[a]" '
             f'-map "[a]" -c:a libmp3lame -q:a 2 "{mixed_temp_path}"'
         )
         if run_ffmpeg(mix_cmd):
@@ -177,4 +177,4 @@ def mix_audio_v4(asset_audio, picked_audio, output_path):
             print("❌ Mixing failed")
 
 # Sử dụng với file của bạn (Ví dụ)
-mix_audio_v4("twinkle_star.mp3", "Heartbeat5_bpm140.wav", "demo_version_4.mp3")
+mix_audio_v4("twinkle_star.mp3", "Heartbeat5_bpm140.wav", "demo_version_4.1.mp3")
