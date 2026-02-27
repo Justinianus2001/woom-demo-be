@@ -74,7 +74,7 @@ def mix_all(
         with zipfile.ZipFile(zip_path, 'w') as zipf:
             # Using ThreadPoolExecutor with lower workers prevents Out-Of-Memory (OOM) 
             # and fork/OpenBLAS segment faults that abruptly kill processes.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 futures = {}
                 for filename, mix_func in outputs.items():
                     out_path = os.path.join(temp_dir, filename)

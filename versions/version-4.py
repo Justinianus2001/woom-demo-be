@@ -9,7 +9,7 @@ import soundfile as sf
 def calculate_duration_from_analysis(picked_audio, num_beats=4):
     """Phân tích để lấy duration cho N nhịp tim."""
     try:
-        y, sr = librosa.load(picked_audio, sr=None)
+        y, sr = librosa.load(picked_audio, sr=None, duration=30.0)
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
         if isinstance(tempo, np.ndarray):
             tempo = float(tempo[0]) if tempo.size > 0 else 120.0
@@ -23,7 +23,7 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
 def detect_tempo(audio_path):
     """Tự detect tempo của file audio dùng Librosa."""
     try:
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = librosa.load(audio_path, sr=None, duration=60.0)
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         if isinstance(tempo, np.ndarray):
             tempo = float(tempo[0]) if tempo.size > 0 else 120.0
@@ -79,11 +79,8 @@ def time_stretch_heartbeat(input_path, output_path, target_tempo_for_heartbeat, 
         run_ffmpeg(f'ffmpeg -y -i "{input_path}" "{output_path}"')
 
 def tune_to_432hz(input_path, output_path):
-    """Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz."""
-    y, sr = librosa.load(input_path, sr=None)
-    n_steps = 12 * np.log2(432 / 440)  # ≈ -0.3176 semitones
-    y_tuned = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
-    sf.write(output_path, y_tuned, sr)
+    cmd = f'ffmpeg -y -i "{input_path}" -af "asetrate=44100*432/440,aresample=44100,atempo=1.0185185185185186" "{output_path}"'
+    run_ffmpeg(cmd)
 
 def mix_audio_v4(asset_audio, picked_audio, output_path):
     """Mix cải tiến: Tự detect tempo, stretch tim khớp 2x tempo nhạc, tỉ lệ 0.8:0.2, tinh chỉnh norm, 432Hz tuning."""

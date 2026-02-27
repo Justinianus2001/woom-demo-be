@@ -10,7 +10,7 @@ import soundfile as sf
 def calculate_duration_from_analysis(picked_audio, num_beats=4):
     """Phân tích file để lấy duration chính xác cho N nhịp tim."""
     try:
-        y, sr = librosa.load(picked_audio, sr=None)
+        y, sr = librosa.load(picked_audio, sr=None, duration=30.0)
         if len(y) == 0:
             return None, 120.0
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
@@ -28,7 +28,7 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
 def detect_tempo(audio_path):
     """Tự detect tempo của file audio dùng Librosa."""
     try:
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = librosa.load(audio_path, sr=None, duration=60.0)
         if len(y) == 0:
             return 120.0
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
@@ -101,11 +101,11 @@ def apply_noise_reduction(y, sr):
     return y_percussive
 
 def tune_to_432hz(input_path, output_path):
-    """Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz."""
-    y, sr = librosa.load(input_path, sr=None)
-    n_steps = 12 * np.log2(432 / 440)  # ≈ -0.3176 semitones
-    y_tuned = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
-    sf.write(output_path, y_tuned, sr)
+    """Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz dùng FFmpeg."""
+    # asetrate changes pitch and speed, atempo corrects the speed back.
+    # 432/440 = 0.981818... and 440/432 = 1.018518...
+    cmd = f'ffmpeg -y -i "{input_path}" -af "asetrate=44100*432/440,aresample=44100,atempo=1.0185185185185186" "{output_path}"'
+    run_ffmpeg(cmd)
 
 def time_stretch_heartbeat(input_path, output_path, target_tempo, original_tempo):
     """Stretch nhịp tim dùng FFmpeg atempo."""
@@ -232,9 +232,12 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         picked_seg.export(normalized_picked_path, format="wav")
 
         # Asset Stretch
-        y_asset, sr_asset = librosa.load(asset_audio, sr=None)
-        y_stretched = librosa.effects.time_stretch(y_asset, rate=tempo_factor)
-        sf.write(stretched_asset_path, y_stretched, sr_asset)
+        if tempo_factor != 1.0:
+            rate = max(0.5, min(2.0, tempo_factor))
+            run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -filter:a "atempo={rate}" "{stretched_asset_path}"')
+        else:
+            # Just copy if no stretch needed to save processing time
+            run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -c copy "{stretched_asset_path}"')
 
         run_ffmpeg(f'ffmpeg -y -i "{stretched_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
 

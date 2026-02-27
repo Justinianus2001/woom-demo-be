@@ -12,7 +12,7 @@ import torchaudio  # Sử dụng để noise reduction nếu có model, nhưng f
 def calculate_duration_from_analysis(picked_audio):
     """Phân tích file để lấy duration chính xác cho 4 nhịp tim (dùng Librosa)."""
     try:
-        y, sr = librosa.load(picked_audio, sr=None)
+        y, sr = librosa.load(picked_audio, sr=None, duration=30.0)
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
         if len(beats) >= 5:
             duration = librosa.frames_to_time(beats[4] - beats[0], sr=sr)
@@ -44,18 +44,16 @@ def apply_noise_reduction(y, sr):
     return y_percussive  # Giữ percussive là nhịp tim đập
 
 def match_tempo(asset_path, tempo_factor, output_path):
-    """Cải tiến: Time-stretch asset để khớp tempo chính xác dùng Librosa."""
-    y, sr = librosa.load(asset_path, sr=None)
-    y_stretched = librosa.effects.time_stretch(y, rate=tempo_factor)
-    sf.write(output_path, y_stretched, sr)
+    if tempo_factor != 1.0:
+        rate = max(0.5, min(2.0, tempo_factor))
+        run_ffmpeg(f'ffmpeg -y -i "{asset_path}" -filter:a "atempo={rate}" "{output_path}"')
+    else:
+        run_ffmpeg(f'ffmpeg -y -i "{asset_path}" -c copy "{output_path}"')
     return output_path
 
 def tune_to_432hz(input_path, output_path):
-    """Cải tiến: Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz."""
-    y, sr = librosa.load(input_path, sr=None)
-    n_steps = 12 * np.log2(432 / 440)  # ≈ -0.3176 semitones
-    y_tuned = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
-    sf.write(output_path, y_tuned, sr)
+    cmd = f'ffmpeg -y -i "{input_path}" -af "asetrate=44100*432/440,aresample=44100,atempo=1.0185185185185186" "{output_path}"'
+    run_ffmpeg(cmd)
 
 def mix_audio(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120):
     """Mix audio cải tiến: HPSS khử tạp âm, time-stretch tempo, dynamic threshold, tune to 432Hz."""

@@ -9,7 +9,7 @@ import soundfile as sf
 def calculate_duration_from_analysis(picked_audio, num_beats=4):
     """Phân tích để lấy duration cho N nhịp tim (giảm density)."""
     try:
-        y, sr = librosa.load(picked_audio, sr=None)
+        y, sr = librosa.load(picked_audio, sr=None, duration=30.0)
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
         if isinstance(tempo, np.ndarray):
             tempo = float(tempo[0]) if tempo.size > 0 else 120.0
@@ -23,7 +23,7 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
 def detect_tempo(audio_path):
     """Tự detect tempo của file audio dùng Librosa."""
     try:
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = librosa.load(audio_path, sr=None, duration=60.0)
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         if isinstance(tempo, np.ndarray):
             tempo = float(tempo[0]) if tempo.size > 0 else 120.0

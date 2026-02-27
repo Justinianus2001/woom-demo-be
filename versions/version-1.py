@@ -10,7 +10,7 @@ import soundfile as sf
 def calculate_duration_from_analysis(picked_audio):
     """Phân tích file để lấy duration chính xác cho 4 nhịp tim (dùng Librosa)."""
     try:
-        y, sr = librosa.load(picked_audio, sr=None)
+        y, sr = librosa.load(picked_audio, sr=None, duration=30.0)
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
         if len(beats) >= 5:  # Cần ít nhất 5 beats để có 4 intervals
             duration = librosa.frames_to_time(beats[4] - beats[0], sr=sr)
