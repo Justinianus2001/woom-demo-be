@@ -18,6 +18,7 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
             tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
         else:
             tempo = float(tempo)
+        if tempo <= 0: tempo = 120.0
         if len(beats) >= num_beats + 1:
             duration = librosa.frames_to_time(beats[num_beats] - beats[0], sr=sr)
             return duration, tempo
@@ -36,6 +37,7 @@ def detect_tempo(audio_path):
             tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
         else:
             tempo = float(tempo)
+        if tempo <= 0: tempo = 120.0
         return tempo
     except Exception as e:
         print(f"❌ Detect tempo thất bại: {e}")
@@ -254,9 +256,11 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
 def mix_audio_v3(asset_audio, picked_audio, output_path):
     """Version 3: Detect tempo, stretch heartbeat to match music tempo."""
     duration_seconds, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if heart_tempo <= 0: heart_tempo = 120.0
     if duration_seconds is None:
         duration_seconds = 4 * (60.0 / heart_tempo) + 0.5
     music_tempo = detect_tempo(asset_audio)
+    if music_tempo <= 0: music_tempo = 120.0
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
@@ -295,9 +299,11 @@ def mix_audio_v3(asset_audio, picked_audio, output_path):
 def mix_audio_v4(asset_audio, picked_audio, output_path):
     """Version 4: Stretch heartbeat to 2x music tempo, 432Hz tuning."""
     duration_seconds, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if heart_tempo <= 0: heart_tempo = 120.0
     if duration_seconds is None:
         duration_seconds = 4 * (60.0 / heart_tempo) + 0.5
     music_tempo = detect_tempo(asset_audio)
+    if music_tempo <= 0: music_tempo = 120.0
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')

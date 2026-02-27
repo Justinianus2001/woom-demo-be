@@ -86,10 +86,12 @@ def mix_audio_v4(asset_audio, picked_audio, output_path):
     """Mix cải tiến: Tự detect tempo, stretch tim khớp 2x tempo nhạc, tỉ lệ 0.8:0.2, tinh chỉnh norm, 432Hz tuning."""
     print("🔎 Phân tích nhịp tim...")
     duration_seconds, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if heart_tempo <= 0: heart_tempo = 120.0
     if duration_seconds is None:
         duration_seconds = 4 * (60.0 / heart_tempo) + 0.5
 
     music_tempo = detect_tempo(asset_audio)
+    if music_tempo <= 0: music_tempo = 120.0
     print(f"📊 Heart BPM: {heart_tempo:.2f}, Music BPM: {music_tempo:.2f}")
 
     with tempfile.TemporaryDirectory() as temp_dir:
