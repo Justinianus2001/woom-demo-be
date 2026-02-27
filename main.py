@@ -1,17 +1,25 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import os
 import tempfile
 import zipfile
 import logging
+import base64
+import json
 from typing import List
 from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm, adjust_bpm
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Woom Audio Mixer API")
+
+# Define the tracks directory
+TRACKS_DIR = os.path.join(os.path.dirname(__file__), "tracks")
+os.makedirs(TRACKS_DIR, exist_ok=True)
 
 app = FastAPI(title="Woom Audio Mixer API")
 
@@ -32,77 +40,129 @@ def cleanup_temp(temp_dir: str):
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
 
+@app.get("/tracks/{track_name}")
+def get_track(track_name: str):
+    """Serve a specific background music track file."""
+    try:
+        file_path = os.path.join(TRACKS_DIR, track_name)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Track not found")
+        return FileResponse(file_path)
+    except Exception as e:
+        logger.error(f"Error serving track {track_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/tracks")
+def list_tracks():
+    """Return list of available background music tracks."""
+    try:
+        if not os.path.exists(TRACKS_DIR):
+            return {"tracks": []}
+        files = [f for f in os.listdir(TRACKS_DIR) if f.endswith(('.mp3', '.wav', '.m4a'))]
+        return {"tracks": sorted(files)}
+    except Exception as e:
+        logger.error(f"Error listing tracks: {e}")
+        return {"tracks": []}
+
 @app.post("/mix-all")
 def mix_all(
     background_tasks: BackgroundTasks,
-    asset: UploadFile = File(...),
-    picked: UploadFile = File(...)
+    picked: UploadFile = File(...),
+    track_name: str = Form(...)
 ):
     """
-    Inputs two audio files (asset and picked) and returns a ZIP file with 4 mixed versions.
+    Mix heartbeat (picked) with a pre-selected background music track.
+    Streams results progressively as JSON Lines (one object per completed version).
+    Each line contains: {version, status, progress, data (base64 audio)}.
     """
     temp_dir = tempfile.mkdtemp()
     background_tasks.add_task(cleanup_temp, temp_dir)
     
     try:
-        # Sanitize filenames for path joining
-        asset_filename = "".join([c for c in asset.filename if c.isalnum() or c in "._-"])
-        picked_filename = "".join([c for c in picked.filename if c.isalnum() or c in "._-"])
+        # Validate track exists
+        asset_path = os.path.join(TRACKS_DIR, track_name)
+        if not os.path.exists(asset_path):
+            raise HTTPException(status_code=400, detail=f"Track '{track_name}' not found.")
         
-        asset_path = os.path.join(temp_dir, f"asset_{asset_filename}")
+        # Save heartbeat file
+        picked_filename = "".join([c for c in picked.filename if c.isalnum() or c in "._-"])
         picked_path = os.path.join(temp_dir, f"picked_{picked_filename}")
-
-        # Save uploaded files
-        with open(asset_path, "wb") as buffer:
-            shutil.copyfileobj(asset.file, buffer)
         with open(picked_path, "wb") as buffer:
             shutil.copyfileobj(picked.file, buffer)
-
-        # Define output paths
-        outputs = {
-            "v1_mixed.mp3": mix_audio_v1,
-            "v2_mixed.mp3": mix_audio_v2,
-            "v3_mixed.mp3": mix_audio_v3,
-            "v4_mixed.mp3": mix_audio_v4
-        }
         
-        # Results storage
-        zip_path = os.path.join(temp_dir, "mixed_versions.zip")
-        any_success = False
+        # Pre-calculate audio features to share across versions (saves roughly 15-20s total)
+        from processor import calculate_duration_from_analysis, detect_tempo
+        logger.info("Analyzing audio tracks...")
+        heart_duration, heart_tempo = calculate_duration_from_analysis(picked_path)
+        music_tempo = detect_tempo(asset_path)
+        
+        # Define mixing functions and implementations
+        # Each version now receives the shared analysis results
+        versions = [
+            ("v1", mix_audio_v1, {"heart_duration": heart_duration}),
+            ("v2", mix_audio_v2, {"heart_duration": heart_duration}),
+            ("v3", mix_audio_v3, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo}),
+            ("v4", mix_audio_v4, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo}),
+        ]
+        
+        def generate_results():
+            """Generator that yields JSON lines as each version completes."""
+            import concurrent.futures
+            import threading
+            
+            # Atomic counter to track finished tasks correctly
+            finished_lock = threading.Lock()
+            finished_count = 0
 
-        import concurrent.futures
-        with zipfile.ZipFile(zip_path, 'w') as zipf:
-            # Using ThreadPoolExecutor with lower workers prevents Out-Of-Memory (OOM) 
-            # and fork/OpenBLAS segment faults that abruptly kill processes.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # Increase max_workers to 4 to process all versions in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {}
-                for filename, mix_func in outputs.items():
-                    out_path = os.path.join(temp_dir, filename)
-                    logger.info(f"Dispatching {filename}...")
-                    futures[executor.submit(mix_func, asset_path, picked_path, out_path)] = filename
+                for version_name, mix_func, extra_args in versions:
+                    out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
+                    logger.info(f"Submitting {version_name}...")
+                    futures[executor.submit(mix_func, asset_path, picked_path, out_path, **extra_args)] = version_name
                 
                 for future in concurrent.futures.as_completed(futures):
-                    filename = futures[future]
-                    out_path = os.path.join(temp_dir, filename)
+                    version_name = futures[future]
+                    with finished_lock:
+                        finished_count += 1
+                        current_progress = finished_count
+
                     try:
                         future.result()
+                        out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
                         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                            zipf.write(out_path, filename)
-                            any_success = True
-                            logger.info(f"Successfully added {filename} to zip.")
+                            # Read and encode audio as base64
+                            with open(out_path, "rb") as f:
+                                audio_data = base64.b64encode(f.read()).decode('utf-8')
+                            result = {
+                                "version": version_name,
+                                "status": "done",
+                                "progress": f"{current_progress}/4",
+                                "data": audio_data
+                            }
+                            yield json.dumps(result) + "\n"
+                            logger.info(f"Streamed {version_name} (Progress: {current_progress}/4)")
                         else:
-                            logger.warning(f"File {filename} was not created or is empty.")
+                            logger.warning(f"File {version_name} was not created or is empty.")
+                            result = {
+                                "version": version_name,
+                                "status": "failed",
+                                "progress": f"{current_progress}/4",
+                                "error": "Output file not created"
+                            }
+                            yield json.dumps(result) + "\n"
                     except Exception as e:
-                        logger.error(f"Error creating {filename}: {e}")
-
-        if not any_success:
-            raise HTTPException(status_code=500, detail="All mixing methods failed. Please check if FFmpeg is installed and files are valid.")
-
-        return FileResponse(
-            zip_path, 
-            media_type="application/zip", 
-            filename="mixed_versions.zip"
-        )
+                        logger.error(f"Error creating {version_name}: {e}")
+                        result = {
+                            "version": version_name,
+                            "status": "failed",
+                            "progress": f"{current_progress}/4",
+                            "error": str(e)
+                        }
+                        yield json.dumps(result) + "\n"
+        
+        return StreamingResponse(generate_results(), media_type="application/x-ndjson")
 
     except Exception as e:
         logger.error(f"Global error in /mix-all: {e}")
@@ -134,7 +194,7 @@ def adjust_bpm_endpoint(
             safe = "".join(c for c in speed if c.isalnum() or c in "._-")
             if not safe:
                 continue
-            out_name = f"{safe}.mp3"
+            out_name = f"{safe}.flac"
             out_path = os.path.join(temp_dir, out_name)
             try:
                 adjust_bpm(input_path, out_path, speed)
