@@ -89,18 +89,35 @@ def adjust_bpm(input_path: str, output_path: str, speed_mode: str):
     # FFmpeg decide internally.)
     if speed <= 0 or speed is None or isinstance(speed, complex):
         speed = 1.0
-    speed = max(0.1, min(10.0, speed))
+    speed = max(0.5, min(100.0, speed))
 
     print(f"Adjusting BPM: Mode='{speed_mode}', Factor={speed}")
-    cmd = f'ffmpeg -y -i "{input_path}" -af "atempo={speed}" "{output_path}"'
+    # select codec based on output extension
+    codec = ''
+    if output_path.lower().endswith('.flac'):
+        codec = ' -c:a flac'
+    elif output_path.lower().endswith('.mp3'):
+        codec = ' -c:a libmp3lame -q:a 2'
+
+    atempo_str = get_atempo_filter(speed)
+    cmd = f'ffmpeg -y -i "{input_path}" -af "{atempo_str}"{codec} "{output_path}"'
     if not run_ffmpeg(cmd):
         # copy through if atempo fails
-        run_ffmpeg(f'ffmpeg -y -i "{input_path}" "{output_path}"')
+        run_ffmpeg(f'ffmpeg -y -i "{input_path}"{codec} "{output_path}"')
 
 def apply_noise_reduction(y, sr):
     """Sử dụng HPSS từ Librosa để tách percussive (nhịp tim)."""
     y_harmonic, y_percussive = librosa.effects.hpss(y)
     return y_percussive
+
+
+def codec_args(output_path: str):
+    """Return codec arguments for ffmpeg based on file extension."""
+    if output_path.lower().endswith('.flac'):
+        # use flac codec with decent compression
+        return '-c:a flac -compression_level 8'
+    else:
+        return '-c:a libmp3lame -q:a 2'
 
 def tune_to_432hz(input_path, output_path):
     """Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz dùng FFmpeg."""
@@ -108,6 +125,19 @@ def tune_to_432hz(input_path, output_path):
     # 432/440 = 0.981818... and 440/432 = 1.018518...
     cmd = f'ffmpeg -y -i "{input_path}" -af "asetrate=44100*432/440,aresample=44100,atempo=1.0185185185185186" "{output_path}"'
     run_ffmpeg(cmd)
+
+def get_atempo_filter(rate):
+    """Helper to generate atempo filter string, chaining if rate is outside [0.5, 100]."""
+    if rate <= 0: return "atempo=1.0"
+    filters = []
+    while rate < 0.5:
+        filters.append("atempo=0.5")
+        rate /= 0.5
+    while rate > 100.0:
+        filters.append("atempo=100.0")
+        rate /= 100.0
+    filters.append(f"atempo={rate}")
+    return ",".join(filters)
 
 def time_stretch_heartbeat(input_path, output_path, target_tempo, original_tempo):
     """Stretch nhịp tim dùng FFmpeg atempo."""
@@ -119,17 +149,17 @@ def time_stretch_heartbeat(input_path, output_path, target_tempo, original_tempo
     if rate <= 0 or np.isinf(rate) or np.isnan(rate):
         rate = 1.0
     
-    # Cap rate for stability
-    rate = max(0.3, min(3.0, rate))
-
-    stretch_cmd = f'ffmpeg -y -i "{input_path}" -filter:a "atempo={rate}" "{output_path}"'
+    atempo_str = get_atempo_filter(rate)
+    stretch_cmd = f'ffmpeg -y -i "{input_path}" -filter:a "{atempo_str}" "{output_path}"'
     if not run_ffmpeg(stretch_cmd):
         run_ffmpeg(f'ffmpeg -y -i "{input_path}" "{output_path}"')
 
-def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120):
+def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None):
     """Version 1: Basic mixing with volume balancing and trimming."""
     tempo_factor = original_bpm / target_bpm
-    duration_seconds, _ = calculate_duration_from_analysis(picked_audio)
+    duration_seconds = heart_duration
+    if duration_seconds is None:
+        duration_seconds, _ = calculate_duration_from_analysis(picked_audio)
 
     if duration_seconds is None:
         duration_seconds = 4 * (60.0 / original_bpm)
@@ -186,12 +216,16 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             asset_filter = f"[0:a]atempo={tempo_factor},volume={abs(diff)}dB[a0];"
             picked_filter = f"[1:a]aloop=loop=-1:size=2e+09[a1];"
 
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{picked_filter} {asset_filter} [a0][a1]amix=inputs=2:duration=first:dropout_transition=2:weights=0.6 0.4[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{output_path}"')
+        enc = codec_args(output_path)
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{picked_filter} {asset_filter} [a0][a1]amix=inputs=2:duration=first:dropout_transition=2:weights=0.6 0.4[a]" -map "[a]" {enc} "{output_path}"')
 
-def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120):
+def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None):
     """Version 2: HPSS, dynamic threshold, tune to 432Hz."""
     tempo_factor = original_bpm / target_bpm
-    duration_seconds, _ = calculate_duration_from_analysis(picked_audio)
+    duration_seconds = heart_duration
+    if duration_seconds is None:
+        duration_seconds, _ = calculate_duration_from_analysis(picked_audio)
+    
     if duration_seconds is None:
         duration_seconds = 4 * (60.0 / original_bpm) + 0.5
     else:
@@ -250,16 +284,21 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         asset_filter = f"[0:a]volume={max(0, -diff)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
 
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{mixed_temp_path}"')
+        enc = codec_args(mixed_temp_path)
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{mixed_temp_path}"')
         tune_to_432hz(mixed_temp_path, output_path)
 
-def mix_audio_v3(asset_audio, picked_audio, output_path):
+def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None):
     """Version 3: Detect tempo, stretch heartbeat to match music tempo."""
-    duration_seconds, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if heart_duration is None or heart_tempo is None:
+        heart_duration, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    
     if heart_tempo <= 0: heart_tempo = 120.0
-    if duration_seconds is None:
-        duration_seconds = 4 * (60.0 / heart_tempo) + 0.5
-    music_tempo = detect_tempo(asset_audio)
+    if heart_duration is None:
+        heart_duration = 4 * (60.0 / heart_tempo) + 0.5
+    
+    if music_tempo is None:
+        music_tempo = detect_tempo(asset_audio)
     if music_tempo <= 0: music_tempo = 120.0
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -281,7 +320,7 @@ def mix_audio_v3(asset_audio, picked_audio, output_path):
 
         # Trim & Normalize
         picked_seg = AudioSegment.from_file(stretched_path)
-        adjusted_duration = duration_seconds * (heart_tempo / music_tempo)
+        adjusted_duration = heart_duration * (heart_tempo / music_tempo)
         picked_seg = picked_seg[:int(adjusted_duration * 1000)].normalize() - 14
         picked_seg.export(normalized_picked_path, format="wav")
 
@@ -294,15 +333,20 @@ def mix_audio_v3(asset_audio, picked_audio, output_path):
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
 
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{output_path}"')
+        enc = codec_args(output_path)
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{output_path}"')
 
-def mix_audio_v4(asset_audio, picked_audio, output_path):
+def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None):
     """Version 4: Stretch heartbeat to 2x music tempo, 432Hz tuning."""
-    duration_seconds, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if heart_duration is None or heart_tempo is None:
+        heart_duration, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    
     if heart_tempo <= 0: heart_tempo = 120.0
-    if duration_seconds is None:
-        duration_seconds = 4 * (60.0 / heart_tempo) + 0.5
-    music_tempo = detect_tempo(asset_audio)
+    if heart_duration is None:
+        heart_duration = 4 * (60.0 / heart_tempo) + 0.5
+    
+    if music_tempo is None:
+        music_tempo = detect_tempo(asset_audio)
     if music_tempo <= 0: music_tempo = 120.0
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -340,5 +384,6 @@ def mix_audio_v4(asset_audio, picked_audio, output_path):
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
 
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.75 0.25[a]" -map "[a]" -c:a libmp3lame -q:a 2 "{mixed_temp_path}"')
+        enc = codec_args(mixed_temp_path)
+        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.75 0.25[a]" -map "[a]" {enc} "{mixed_temp_path}"')
         tune_to_432hz(mixed_temp_path, output_path)
