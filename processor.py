@@ -171,7 +171,8 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
         normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
 
-        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 2 -ar 44100 "{temp_wav_path}"')
+        # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 2 -ar 44100 "{temp_wav_path}"')
 
         # Filter
         y, sr = sf.read(temp_wav_path)
@@ -241,7 +242,8 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
         mixed_temp_path = os.path.join(temp_dir, 'mixed_temp.mp3')
 
-        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 2 -ar 44100 "{temp_wav_path}"')
+        # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 2 -ar 44100 "{temp_wav_path}"')
 
         # HPSS
         y, sr = sf.read(temp_wav_path)
@@ -308,7 +310,8 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
         normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
 
-        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 1 -ar 44100 "{temp_wav_path}"')
+        # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
 
         # HPSS
         y, sr = sf.read(temp_wav_path)
@@ -357,7 +360,8 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
         mixed_temp_path = os.path.join(temp_dir, 'mixed_temp.mp3')
 
-        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -ac 1 -ar 44100 "{temp_wav_path}"')
+        # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
+        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
 
         # HPSS
         y, sr = sf.read(temp_wav_path)
