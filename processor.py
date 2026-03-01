@@ -174,9 +174,10 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         duration_seconds = 4 * (60.0 / original_bpm)
 
     logger.info(f"[v1] Starting mix_audio_v1 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    temp_dir_obj = tempfile.TemporaryDirectory()
+    temp_dir = temp_dir_obj.name
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         filtered_path = os.path.join(temp_dir, 'picked_filtered.wav')
         silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
@@ -236,6 +237,8 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
     except Exception as e:
         logger.error(f"[v1] Error during mix_audio_v1: {e}\n{traceback.format_exc()}")
         raise
+    finally:
+        temp_dir_obj.cleanup()
 
 def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None):
     """Version 2: HPSS, dynamic threshold, tune to 432Hz."""
@@ -250,9 +253,10 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         duration_seconds += 0.5
 
     logger.info(f"[v2] Starting mix_audio_v2 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    temp_dir_obj = tempfile.TemporaryDirectory()
+    temp_dir = temp_dir_obj.name
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
         silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
         trimmed_path = os.path.join(temp_dir, 'picked_trimmed.wav')
@@ -312,6 +316,8 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
     except Exception as e:
         logger.error(f"[v2] Error during mix_audio_v2: {e}\n{traceback.format_exc()}")
         raise
+    finally:
+        temp_dir_obj.cleanup()
 
 def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None):
     """Version 3: Detect tempo, stretch heartbeat to match music tempo."""
@@ -327,9 +333,10 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
     if music_tempo <= 0: music_tempo = 120.0
 
     logger.info(f"[v3] Starting mix_audio_v3 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    temp_dir_obj = tempfile.TemporaryDirectory()
+    temp_dir = temp_dir_obj.name
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
         stretched_path = os.path.join(temp_dir, 'picked_stretched.wav')
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
@@ -369,6 +376,8 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
     except Exception as e:
         logger.error(f"[v3] Error during mix_audio_v3: {e}\n{traceback.format_exc()}")
         raise
+    finally:
+        temp_dir_obj.cleanup()
 
 def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None):
     """Version 4: Stretch heartbeat to 2x music tempo, 432Hz tuning."""
@@ -384,9 +393,10 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
     if music_tempo <= 0: music_tempo = 120.0
 
     logger.info(f"[v4] Starting mix_audio_v4 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    temp_dir_obj = tempfile.TemporaryDirectory()
+    temp_dir = temp_dir_obj.name
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
         stretched_path = os.path.join(temp_dir, 'picked_stretched.wav')
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
@@ -428,4 +438,6 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
     except Exception as e:
         logger.error(f"[v4] Error during mix_audio_v4: {e}\n{traceback.format_exc()}")
         raise
+    finally:
+        temp_dir_obj.cleanup()
 
