@@ -75,6 +75,8 @@ def mix_all(
     Streams results progressively as JSON Lines (one object per completed version).
     Each line contains: {version, status, progress, data (base64 audio)}.
     """
+    logger.info(f"==========> [/mix-all] NEW REQUEST STARTED. Track: '{track_name}', UploadFile: '{picked.filename}' (content_type: {picked.content_type})")
+    
     temp_dir = tempfile.mkdtemp()
     background_tasks.add_task(cleanup_temp, temp_dir)
     
@@ -90,11 +92,12 @@ def mix_all(
         # Save heartbeat file
         picked_filename = "".join([c for c in picked.filename if c.isalnum() or c in "._-"])
         picked_path = os.path.join(temp_dir, f"picked_{picked_filename}")
+        logger.info(f"[/mix-all] Starting to write user uploaded file to local temp disk: {picked_path}")
         with open(picked_path, "wb") as buffer:
             shutil.copyfileobj(picked.file, buffer)
             
         file_size = os.path.getsize(picked_path)
-        logger.info(f"Saved picked file to {picked_path}. Size: {file_size} bytes.")
+        logger.info(f"[/mix-all] Finished uploading and saving user file to disk. Size: {file_size} bytes.")
         
         # Pre-calculate audio features to share across versions (saves roughly 15-20s total)
         from processor import calculate_duration_from_analysis, detect_tempo
@@ -188,10 +191,12 @@ def adjust_bpm_endpoint(
     send the mix generated previously along with either `Slow`, `Normal` or
     `Fast` (or any custom factor) values.
     """
+    logger.info(f"==========> [/adjust-bpm] NEW REQUEST STARTED. UploadFile: '{file.filename}', speeds: {speeds}")
+    
     temp_dir = tempfile.mkdtemp()
     background_tasks.add_task(cleanup_temp, temp_dir)
 
-    logger.info(f"Received adjust-bpm request: file='{file.filename}', speeds={speeds}")
+    logger.info(f"[/adjust-bpm] Starting to write user input file to local temp disk...")
 
     # save incoming file
     input_path = os.path.join(temp_dir, "input_mix.mp3")
@@ -199,7 +204,7 @@ def adjust_bpm_endpoint(
         shutil.copyfileobj(file.file, buf)
 
     file_size = os.path.getsize(input_path)
-    logger.info(f"Saved input file to {input_path}. Size: {file_size} bytes.")
+    logger.info(f"[/adjust-bpm] Finished uploading and saving user file. Saved input file to disk. Size: {file_size} bytes.")
 
     zip_path = os.path.join(temp_dir, "bpm_adjusted.zip")
     with zipfile.ZipFile(zip_path, "w") as zipf:
