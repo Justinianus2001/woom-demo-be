@@ -6,6 +6,10 @@ from pydub import AudioSegment
 import numpy as np
 from scipy import signal
 import soundfile as sf
+import logging
+import traceback
+
+logger = logging.getLogger(__name__)
 
 def calculate_duration_from_analysis(picked_audio, num_beats=4):
     """Phân tích file để lấy duration chính xác cho N nhịp tim."""
@@ -23,7 +27,7 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
             duration = librosa.frames_to_time(beats[num_beats] - beats[0], sr=sr)
             return duration, tempo
     except Exception as e:
-        print(f"❌ Phân tích thất bại: {e}")
+        logger.error(f"❌ Phân tích thất bại: {e}\n{traceback.format_exc()}")
     return None, 120.0
 
 def detect_tempo(audio_path):
@@ -40,7 +44,7 @@ def detect_tempo(audio_path):
         if tempo <= 0: tempo = 120.0
         return tempo
     except Exception as e:
-        print(f"❌ Detect tempo thất bại: {e}")
+        logger.error(f"❌ Detect tempo thất bại: {e}\n{traceback.format_exc()}")
         return 120.0
 
 def get_mean_volume(audio_path):
@@ -49,16 +53,21 @@ def get_mean_volume(audio_path):
         audio = AudioSegment.from_file(audio_path)
         return audio.dBFS
     except Exception as e:
-        print(f"❌ Đo volume thất bại: {e}")
+        logger.error(f"❌ Đo volume thất bại: {e}\n{traceback.format_exc()}")
         return -16.0
 
 def run_ffmpeg(command):
     """Chạy FFmpeg command và check success."""
-    process = subprocess.run(command, shell=True, capture_output=True, text=True)
-    if process.returncode != 0:
-        print(f"❌ FFmpeg failed: {process.stderr}")
+    logger.info(f"Running ffmpeg command: {command}")
+    try:
+        process = subprocess.run(command, shell=True, capture_output=True, text=True)
+        if process.returncode != 0:
+            logger.error(f"❌ FFmpeg failed (code {process.returncode}): {process.stderr}\nCommand: {command}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"❌ Exception running FFmpeg: {e}\n{traceback.format_exc()}\nCommand: {command}")
         return False
-    return True
 
 
 def adjust_bpm(input_path: str, output_path: str, speed_mode: str):
@@ -91,7 +100,7 @@ def adjust_bpm(input_path: str, output_path: str, speed_mode: str):
         speed = 1.0
     speed = max(0.5, min(100.0, speed))
 
-    print(f"Adjusting BPM: Mode='{speed_mode}', Factor={speed}")
+    logger.info(f"Adjusting BPM: Mode='{speed_mode}', Factor={speed}, Output={output_path}")
     # select codec based on output extension
     codec = ''
     if output_path.lower().endswith('.flac'):
@@ -164,8 +173,10 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
     if duration_seconds is None:
         duration_seconds = 4 * (60.0 / original_bpm)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+    logger.info(f"[v1] Starting mix_audio_v1 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         filtered_path = os.path.join(temp_dir, 'picked_filtered.wav')
         silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
@@ -218,7 +229,13 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             picked_filter = f"[1:a]aloop=loop=-1:size=2e+09[a1];"
 
         enc = codec_args(output_path)
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{picked_filter} {asset_filter} [a0][a1]amix=inputs=2:duration=first:dropout_transition=2:weights=0.6 0.4[a]" -map "[a]" {enc} "{output_path}"')
+        if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{picked_filter} {asset_filter} [a0][a1]amix=inputs=2:duration=first:dropout_transition=2:weights=0.6 0.4[a]" -map "[a]" {enc} "{output_path}"'):
+            logger.info(f"[v1] Finished successfully -> {output_path}")
+        else:
+            logger.error(f"[v1] mix_audio_v1 failed at the final step")
+    except Exception as e:
+        logger.error(f"[v1] Error during mix_audio_v1: {e}\n{traceback.format_exc()}")
+        raise
 
 def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None):
     """Version 2: HPSS, dynamic threshold, tune to 432Hz."""
@@ -232,8 +249,10 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
     else:
         duration_seconds += 0.5
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+    logger.info(f"[v2] Starting mix_audio_v2 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
         silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
         trimmed_path = os.path.join(temp_dir, 'picked_trimmed.wav')
@@ -289,6 +308,10 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         enc = codec_args(mixed_temp_path)
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{mixed_temp_path}"')
         tune_to_432hz(mixed_temp_path, output_path)
+        logger.info(f"[v2] Finished successfully -> {output_path}")
+    except Exception as e:
+        logger.error(f"[v2] Error during mix_audio_v2: {e}\n{traceback.format_exc()}")
+        raise
 
 def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None):
     """Version 3: Detect tempo, stretch heartbeat to match music tempo."""
@@ -303,8 +326,10 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         music_tempo = detect_tempo(asset_audio)
     if music_tempo <= 0: music_tempo = 120.0
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+    logger.info(f"[v3] Starting mix_audio_v3 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
         stretched_path = os.path.join(temp_dir, 'picked_stretched.wav')
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
@@ -337,7 +362,13 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
 
         enc = codec_args(output_path)
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{output_path}"')
+        if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{output_path}"'):
+            logger.info(f"[v3] Finished successfully -> {output_path}")
+        else:
+            logger.error(f"[v3] mix_audio_v3 failed at final stage")
+    except Exception as e:
+        logger.error(f"[v3] Error during mix_audio_v3: {e}\n{traceback.format_exc()}")
+        raise
 
 def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None):
     """Version 4: Stretch heartbeat to 2x music tempo, 432Hz tuning."""
@@ -352,8 +383,10 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         music_tempo = detect_tempo(asset_audio)
     if music_tempo <= 0: music_tempo = 120.0
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+    logger.info(f"[v4] Starting mix_audio_v4 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
         denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
         stretched_path = os.path.join(temp_dir, 'picked_stretched.wav')
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
@@ -391,3 +424,8 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         enc = codec_args(mixed_temp_path)
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.75 0.25[a]" -map "[a]" {enc} "{mixed_temp_path}"')
         tune_to_432hz(mixed_temp_path, output_path)
+        logger.info(f"[v4] Finished successfully -> {output_path}")
+    except Exception as e:
+        logger.error(f"[v4] Error during mix_audio_v4: {e}\n{traceback.format_exc()}")
+        raise
+

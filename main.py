@@ -82,13 +82,19 @@ def mix_all(
         # Validate track exists
         asset_path = os.path.join(TRACKS_DIR, track_name)
         if not os.path.exists(asset_path):
+            logger.error(f"Track not found: {track_name}")
             raise HTTPException(status_code=400, detail=f"Track '{track_name}' not found.")
+        
+        logger.info(f"Received mix-all request: picked_file='{picked.filename}', track_name='{track_name}'")
         
         # Save heartbeat file
         picked_filename = "".join([c for c in picked.filename if c.isalnum() or c in "._-"])
         picked_path = os.path.join(temp_dir, f"picked_{picked_filename}")
         with open(picked_path, "wb") as buffer:
             shutil.copyfileobj(picked.file, buffer)
+            
+        file_size = os.path.getsize(picked_path)
+        logger.info(f"Saved picked file to {picked_path}. Size: {file_size} bytes.")
         
         # Pre-calculate audio features to share across versions (saves roughly 15-20s total)
         from processor import calculate_duration_from_analysis, detect_tempo
@@ -153,7 +159,8 @@ def mix_all(
                             }
                             yield json.dumps(result) + "\n"
                     except Exception as e:
-                        logger.error(f"Error creating {version_name}: {e}")
+                        import traceback
+                        logger.error(f"Error creating {version_name}: {e}\n{traceback.format_exc()}")
                         result = {
                             "version": version_name,
                             "status": "failed",
@@ -165,7 +172,8 @@ def mix_all(
         return StreamingResponse(generate_results(), media_type="application/x-ndjson")
 
     except Exception as e:
-        logger.error(f"Global error in /mix-all: {e}")
+        import traceback
+        logger.error(f"Global error in /mix-all: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/adjust-bpm")
@@ -183,10 +191,15 @@ def adjust_bpm_endpoint(
     temp_dir = tempfile.mkdtemp()
     background_tasks.add_task(cleanup_temp, temp_dir)
 
+    logger.info(f"Received adjust-bpm request: file='{file.filename}', speeds={speeds}")
+
     # save incoming file
     input_path = os.path.join(temp_dir, "input_mix.mp3")
     with open(input_path, "wb") as buf:
         shutil.copyfileobj(file.file, buf)
+
+    file_size = os.path.getsize(input_path)
+    logger.info(f"Saved input file to {input_path}. Size: {file_size} bytes.")
 
     zip_path = os.path.join(temp_dir, "bpm_adjusted.zip")
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -204,7 +217,8 @@ def adjust_bpm_endpoint(
                 else:
                     logger.warning(f"adjust_bpm produced no output for {speed}")
             except Exception as e:
-                logger.error(f"Error adjusting bpm ({speed}): {e}")
+                import traceback
+                logger.error(f"Error adjusting bpm ({speed}): {e}\n{traceback.format_exc()}")
     return FileResponse(zip_path, media_type="application/zip", filename="bpm_adjusted.zip")
 
 
