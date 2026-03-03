@@ -10,12 +10,6 @@ import base64
 import json
 from typing import List
 from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm
-import threading
-
-# Limit concurrent mix-all processing to avoid 100% CPU saturation.
-# Each mix request is CPU-heavy (4 versions × multiple ffmpeg + numpy/scipy ops).
-# Allow at most 1 mix-all request at a time; extras will queue.
-_mix_semaphore = threading.Semaphore(2)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -190,17 +184,7 @@ def mix_all(
                         }
                         yield json.dumps(result) + "\n"
         
-        def guarded_generate():
-            """Wrap generator with semaphore to limit concurrent processing."""
-            _mix_semaphore.acquire()
-            logger.info("[/mix-all] Acquired processing slot.")
-            try:
-                yield from generate_results()
-            finally:
-                _mix_semaphore.release()
-                logger.info("[/mix-all] Released processing slot.")
-
-        return StreamingResponse(guarded_generate(), media_type="application/x-ndjson")
+        return StreamingResponse(generate_results(), media_type="application/x-ndjson")
 
     except Exception as e:
         import traceback
