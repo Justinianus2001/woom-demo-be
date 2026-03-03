@@ -91,6 +91,11 @@ def run_ffmpeg(command, timeout=FFMPEG_TIMEOUT):
     """
     logger.info(f"Running ffmpeg command: {command}")
     cmd_list = shlex.split(command)
+    # Limit each ffmpeg process to 2 threads to prevent CPU saturation
+    # when multiple ffmpeg processes run concurrently
+    if cmd_list and cmd_list[0].endswith('ffmpeg') and '-threads' not in cmd_list:
+        cmd_list.insert(1, '-threads')
+        cmd_list.insert(2, '2')
     process = None
     try:
         process = subprocess.Popen(
