@@ -83,23 +83,27 @@ def get_mean_volume(audio_path):
 
 
 def run_ffmpeg(command, timeout=FFMPEG_TIMEOUT):
-    """Chạy FFmpeg command với Popen, proper timeout, và process group cleanup.
+    """Chạy FFmpeg command với Popen và proper timeout.
     
-    Không dùng shell=True để tránh orphan process.
+    KHÔNG dùng shell=True (tránh orphan process).
+    KHÔNG dùng start_new_session=True (gây deadlock khi fork trong multi-thread).
     stdin=DEVNULL để tránh ffmpeg chờ input.
-    start_new_session=True để kill cả process group khi timeout.
     """
     logger.info(f"Running ffmpeg command: {command}")
     cmd_list = shlex.split(command)
+    # Thêm -nostdin nếu là ffmpeg command (chặn ffmpeg đọc stdin hoàn toàn)
+    if cmd_list and cmd_list[0].endswith('ffmpeg') and '-nostdin' not in cmd_list:
+        cmd_list.insert(1, '-nostdin')
     process = None
     try:
+        logger.info(f"[run_ffmpeg] Spawning process...")
         process = subprocess.Popen(
             cmd_list,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
         )
+        logger.info(f"[run_ffmpeg] Process spawned (pid={process.pid}), waiting for completion...")
         _stdout, stderr = process.communicate(timeout=timeout)
         success = process.returncode == 0
         if not success:
@@ -107,25 +111,18 @@ def run_ffmpeg(command, timeout=FFMPEG_TIMEOUT):
                 f"❌ FFmpeg failed (code {process.returncode}): "
                 f"{stderr.decode(errors='replace')}\nCommand: {command}"
             )
-        process.terminate()
-        process.wait()
+        logger.info(f"[run_ffmpeg] Process completed (pid={process.pid}, rc={process.returncode})")
         return success
     except subprocess.TimeoutExpired:
-        logger.error(f"❌ FFmpeg TIMEOUT after {timeout}s – killing process group.\nCommand: {command}")
+        logger.error(f"❌ FFmpeg TIMEOUT after {timeout}s – killing.\nCommand: {command}")
         if process is not None:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except OSError:
-                process.kill()
+            process.kill()
             process.wait()
         return False
     except Exception as e:
         logger.error(f"❌ Exception running FFmpeg: {e}\n{traceback.format_exc()}\nCommand: {command}")
         if process is not None and process.poll() is None:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except OSError:
-                process.kill()
+            process.kill()
             process.wait()
         return False
 
