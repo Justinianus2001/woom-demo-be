@@ -9,7 +9,7 @@ import logging
 import base64
 import json
 from typing import List
-from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm, adjust_bpm
+from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)

@@ -84,7 +84,7 @@ def run_ffmpeg(command, timeout=FFMPEG_TIMEOUT):
         return False
 
 
-def adjust_bpm
+def adjust_bpm(input_path, output_path, speed_mode):
     """Adjust playback speed of an audio file using FFmpeg's atempo filter.
 
     The `speed_mode` may be one of the named presets or a numeric factor (as
