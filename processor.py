@@ -404,7 +404,7 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         diff = vol_asset - vol_picked
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
-        logger.info(f"[v3] Finished mixing audio: {mixed_temp_path}")
+        logger.info(f"[v3] Finished mixing audio: {output_path}")
 
         enc = codec_args(output_path)
         if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{output_path}"'):
