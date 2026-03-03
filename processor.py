@@ -199,10 +199,12 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
 
         # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
         run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 2 -ar 44100 "{temp_wav_path}"')
+        logger.info(f"[v1] Finished processing picked audio: {temp_wav_path}")
 
         # Filter
         y, sr = sf.read(temp_wav_path)
         if y.ndim == 1: y = y[:, np.newaxis]
+        logger.info(f"[v1] Finished reading picked audio: {temp_wav_path}")
         nyq = 0.5 * sr
         low = 500 / nyq
         b, a = signal.butter(5, low, btype='low')
@@ -214,27 +216,34 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         if len(y_filtered.shape) == 2 and y_filtered.shape[1] == 1:
             y_filtered = y_filtered.squeeze()
         sf.write(filtered_path, y_filtered, sr)
+        logger.info(f"[v1] Finished filtering picked audio: {filtered_path}")
 
         # Silence remove (using named parameters for compatibility with FFmpeg 7.x)
         run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -af silenceremove=start_periods=1:start_duration=0:start_threshold=-40dB:detection=peak "{silenced_path}"')
+        logger.info(f"[v1] Finished silencing picked audio: {silenced_path}")
         
         # Trim
         run_ffmpeg(f'ffmpeg -y -i "{silenced_path}" -t {duration_seconds} "{normalized_picked_path}"')
+        logger.info(f"[v1] Finished trimming picked audio: {normalized_picked_path}")
         if not os.path.exists(normalized_picked_path) or os.path.getsize(normalized_picked_path) == 0:
             run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -t {duration_seconds} "{normalized_picked_path}"')
+        logger.info(f"[v1] Finished normalizing picked audio: {normalized_picked_path}")
         
         # Normalize Picked
         picked_audio_seg = safe_load_audio_segment(normalized_picked_path).normalize()
         if picked_audio_seg.dBFS < -50: picked_audio_seg += 10
         picked_audio_seg.export(normalized_picked_path, format="wav")
+        logger.info(f"[v1] Finished exporting picked audio: {normalized_picked_path}")
 
         # Normalize Asset
         run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+        logger.info(f"[v1] Finished normalizing asset audio: {normalized_asset_path}")
 
         # Mix
         vol_asset = get_mean_volume(normalized_asset_path)
         vol_picked = get_mean_volume(normalized_picked_path)
         diff = vol_asset - vol_picked
+        logger.info(f"[v1] Volume difference: {diff}")
         
         if diff > 0:
             asset_filter = f"[0:a]atempo={tempo_factor}[a0];"
@@ -281,11 +290,13 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
 
         # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
         run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 2 -ar 44100 "{temp_wav_path}"')
+        logger.info(f"[v2] Finished processing picked audio: {temp_wav_path}")
 
         # HPSS
         y, sr = sf.read(temp_wav_path)
         if y.ndim > 1: y = np.mean(y, axis=1)
         y_denoised = apply_noise_reduction(y, sr)
+        logger.info(f"[v2] Finished denoising picked audio: {denoised_path}")
         sf.write(denoised_path, y_denoised, sr)
 
         # Dynamic Threshold (using named parameters for compatibility with FFmpeg 7.x)
@@ -295,16 +306,21 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
             threshold_db = max(-50, peak_db - 30)
         else:
             threshold_db = -50
+        logger.info(f"[v2] Dynamic threshold: {threshold_db}dB")
         run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -af silenceremove=start_periods=1:start_duration=0:start_threshold={threshold_db}dB:detection=peak "{silenced_path}"')
+        logger.info(f"[v2] Finished silencing picked audio: {silenced_path}")
         
         run_ffmpeg(f'ffmpeg -y -i "{silenced_path}" -t {duration_seconds} "{trimmed_path}"')
+        logger.info(f"[v2] Finished trimming picked audio: {trimmed_path}")
         if not os.path.exists(trimmed_path) or os.path.getsize(trimmed_path) == 0:
             run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -t {duration_seconds} "{trimmed_path}"')
+        logger.info(f"[v2] Finished normalizing picked audio: {trimmed_path}")
         
         # Normalize Picked
         picked_seg = safe_load_audio_segment(trimmed_path).normalize()
         if picked_seg.dBFS < -20: picked_seg += 6
         picked_seg.export(normalized_picked_path, format="wav")
+        logger.info(f"[v2] Finished exporting picked audio: {normalized_picked_path}")
 
         # Asset Stretch
         if tempo_factor != 1.0:
@@ -315,6 +331,7 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
             run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -c copy "{stretched_asset_path}"')
 
         run_ffmpeg(f'ffmpeg -y -i "{stretched_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+        logger.info(f"[v2] Finished normalizing asset audio: {normalized_asset_path}")
 
         # Mix
         vol_asset = get_mean_volume(normalized_asset_path)
@@ -322,6 +339,7 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         diff = vol_asset - vol_picked
         asset_filter = f"[0:a]volume={max(0, -diff)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+        logger.info(f"[v2] Finished mixing audio: {mixed_temp_path}")
 
         enc = codec_args(mixed_temp_path)
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{mixed_temp_path}"')
@@ -358,22 +376,27 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
 
         # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
         run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
+        logger.info(f"[v3] Finished processing picked audio: {temp_wav_path}")
 
         # HPSS
         y, sr = sf.read(temp_wav_path)
         if y.ndim > 1: y = np.mean(y, axis=1)
         y_denoised = apply_noise_reduction(y, sr)
+        logger.info(f"[v3] Finished denoising picked audio: {denoised_path}")
         sf.write(denoised_path, y_denoised, sr)
 
         time_stretch_heartbeat(denoised_path, stretched_path, music_tempo, heart_tempo)
+        logger.info(f"[v3] Finished stretching picked audio: {stretched_path}")
 
         # Trim & Normalize
         picked_seg = safe_load_audio_segment(stretched_path)
         adjusted_duration = heart_duration * (heart_tempo / music_tempo)
         picked_seg = picked_seg[:int(adjusted_duration * 1000)].normalize() - 14
         picked_seg.export(normalized_picked_path, format="wav")
+        logger.info(f"[v3] Finished trimming picked audio: {normalized_picked_path}")
 
         run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+        logger.info(f"[v3] Finished normalizing asset audio: {normalized_asset_path}")
 
         # Mix
         vol_asset = get_mean_volume(normalized_asset_path)
@@ -381,6 +404,7 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         diff = vol_asset - vol_picked
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+        logger.info(f"[v3] Finished mixing audio: {mixed_temp_path}")
 
         enc = codec_args(output_path)
         if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.8 0.2[a]" -map "[a]" {enc} "{output_path}"'):
@@ -419,15 +443,19 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
 
         # Limit to 30 seconds to avoid Out-Of-Memory (OOM) on large audio files
         run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
+        logger.info(f"[v4] Finished processing picked audio: {temp_wav_path}")
 
         # HPSS
         y, sr = sf.read(temp_wav_path)
         if y.ndim > 1: y = np.mean(y, axis=1)
+        logger.info(f"[v4] Finished reading picked audio: {temp_wav_path}")
         y_denoised = apply_noise_reduction(y, sr)
         sf.write(denoised_path, y_denoised, sr)
+        logger.info(f"[v4] Finished denoising picked audio: {denoised_path}")
 
         target_heartbeat_tempo = music_tempo * 2
         time_stretch_heartbeat(denoised_path, stretched_path, target_heartbeat_tempo, heart_tempo)
+        logger.info(f"[v4] Finished stretching picked audio: {stretched_path}")
 
         # Trim & Normalize
         picked_seg = safe_load_audio_segment(stretched_path)
@@ -435,8 +463,10 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         picked_seg = picked_seg[:int(adjusted_duration_ms)].normalize()
         if picked_seg.dBFS < -25: picked_seg += 3
         picked_seg.export(normalized_picked_path, format="wav")
+        logger.info(f"[v4] Finished trimming picked audio: {normalized_picked_path}")
 
         run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+        logger.info(f"[v4] Finished normalizing asset audio: {normalized_asset_path}")
 
         # Mix
         vol_asset = get_mean_volume(normalized_asset_path)
@@ -444,6 +474,7 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         diff = vol_asset - vol_picked
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
         picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+        logger.info(f"[v4] Finished mixing audio: {mixed_temp_path}")
 
         enc = codec_args(mixed_temp_path)
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{asset_filter}{picked_filter}[a0][a1]amix=inputs=2:duration=first:dropout_transition=3:weights=0.75 0.25[a]" -map "[a]" {enc} "{mixed_temp_path}"')
