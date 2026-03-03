@@ -1,4 +1,6 @@
 import subprocess
+import shlex
+import signal
 import os
 import tempfile
 import librosa
@@ -47,40 +49,82 @@ def detect_tempo(audio_path):
         logger.error(f"❌ Detect tempo thất bại: {e}\n{traceback.format_exc()}")
         return 120.0
 
-def safe_load_audio_segment(path, timeout=60):
-    """Load AudioSegment with a timeout to prevent hangs from pydub's internal ffmpeg call."""
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(AudioSegment.from_file, path)
-        return future.result(timeout=timeout)
+FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
+
+def safe_ffmpeg_load(path, timeout=FFMPEG_TIMEOUT):
+    """Load audio file as AudioSegment by converting to WAV via our controlled
+    run_ffmpeg() first, then using pydub's fast WAV path (no internal subprocess).
+    This avoids pydub's internal Popen.communicate() which has no timeout."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.wav':
+        # WAV files can be loaded directly via the fast path
+        return AudioSegment.from_file(path, format='wav')
+    # Convert to WAV first using our controlled subprocess
+    wav_path = path + '.safe_load.wav'
+    try:
+        if not run_ffmpeg(f'ffmpeg -y -i "{path}" -f wav "{wav_path}"', timeout=timeout):
+            raise RuntimeError(f"FFmpeg conversion to WAV failed for {path}")
+        return AudioSegment.from_file(wav_path, format='wav')
+    finally:
+        if os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
 def get_mean_volume(audio_path):
     """Đo mean volume (dBFS) dùng PyDub."""
     try:
-        audio = safe_load_audio_segment(audio_path)
+        audio = safe_ffmpeg_load(audio_path)
         return audio.dBFS
     except Exception as e:
         logger.error(f"❌ Đo volume thất bại: {e}\n{traceback.format_exc()}")
         return -16.0
 
-FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
 
 def run_ffmpeg(command, timeout=FFMPEG_TIMEOUT):
-    """Chạy FFmpeg command và check success, với timeout để tránh treo."""
+    """Chạy FFmpeg command với Popen, proper timeout, và process group cleanup.
+    
+    Không dùng shell=True để tránh orphan process.
+    stdin=DEVNULL để tránh ffmpeg chờ input.
+    start_new_session=True để kill cả process group khi timeout.
+    """
     logger.info(f"Running ffmpeg command: {command}")
+    cmd_list = shlex.split(command)
+    process = None
     try:
-        process = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout
+        process = subprocess.Popen(
+            cmd_list,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
+        _stdout, stderr = process.communicate(timeout=timeout)
         if process.returncode != 0:
-            logger.error(f"❌ FFmpeg failed (code {process.returncode}): {process.stderr}\nCommand: {command}")
+            logger.error(
+                f"❌ FFmpeg failed (code {process.returncode}): "
+                f"{stderr.decode(errors='replace')}\nCommand: {command}"
+            )
             return False
         return True
     except subprocess.TimeoutExpired:
-        logger.error(f"❌ FFmpeg TIMEOUT after {timeout}s – killed.\nCommand: {command}")
+        logger.error(f"❌ FFmpeg TIMEOUT after {timeout}s – killing process group.\nCommand: {command}")
+        if process is not None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except OSError:
+                process.kill()
+            process.wait()
         return False
     except Exception as e:
         logger.error(f"❌ Exception running FFmpeg: {e}\n{traceback.format_exc()}\nCommand: {command}")
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except OSError:
+                process.kill()
+            process.wait()
         return False
 
 
@@ -230,7 +274,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         logger.info(f"[v1] Finished normalizing picked audio: {normalized_picked_path}")
         
         # Normalize Picked
-        picked_audio_seg = safe_load_audio_segment(normalized_picked_path).normalize()
+        picked_audio_seg = safe_ffmpeg_load(normalized_picked_path).normalize()
         if picked_audio_seg.dBFS < -50: picked_audio_seg += 10
         picked_audio_seg.export(normalized_picked_path, format="wav")
         logger.info(f"[v1] Finished exporting picked audio: {normalized_picked_path}")
@@ -317,7 +361,7 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         logger.info(f"[v2] Finished normalizing picked audio: {trimmed_path}")
         
         # Normalize Picked
-        picked_seg = safe_load_audio_segment(trimmed_path).normalize()
+        picked_seg = safe_ffmpeg_load(trimmed_path).normalize()
         if picked_seg.dBFS < -20: picked_seg += 6
         picked_seg.export(normalized_picked_path, format="wav")
         logger.info(f"[v2] Finished exporting picked audio: {normalized_picked_path}")
@@ -389,7 +433,7 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         logger.info(f"[v3] Finished stretching picked audio: {stretched_path}")
 
         # Trim & Normalize
-        picked_seg = safe_load_audio_segment(stretched_path)
+        picked_seg = safe_ffmpeg_load(stretched_path)
         adjusted_duration = heart_duration * (heart_tempo / music_tempo)
         picked_seg = picked_seg[:int(adjusted_duration * 1000)].normalize() - 14
         picked_seg.export(normalized_picked_path, format="wav")
@@ -458,7 +502,7 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         logger.info(f"[v4] Finished stretching picked audio: {stretched_path}")
 
         # Trim & Normalize
-        picked_seg = safe_load_audio_segment(stretched_path)
+        picked_seg = safe_ffmpeg_load(stretched_path)
         adjusted_duration_ms = (4 * (60.0 / target_heartbeat_tempo)) * 1000
         picked_seg = picked_seg[:int(adjusted_duration_ms)].normalize()
         if picked_seg.dBFS < -25: picked_seg += 3
