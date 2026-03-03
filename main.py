@@ -114,6 +114,9 @@ def mix_all(
             ("v4", mix_audio_v4, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo}),
         ]
         
+        # Maximum time (seconds) allowed for a single version to finish processing
+        VERSION_TIMEOUT = 300
+
         def generate_results():
             """Generator that yields JSON lines as each version completes."""
             import concurrent.futures
@@ -131,14 +134,14 @@ def mix_all(
                     logger.info(f"Submitting {version_name}...")
                     futures[executor.submit(mix_func, asset_path, picked_path, out_path, **extra_args)] = version_name
                 
-                for future in concurrent.futures.as_completed(futures):
+                for future in concurrent.futures.as_completed(futures, timeout=VERSION_TIMEOUT * 4):
                     version_name = futures[future]
                     with finished_lock:
                         finished_count += 1
                         current_progress = finished_count
 
                     try:
-                        future.result()
+                        future.result(timeout=VERSION_TIMEOUT)
                         out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
                         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                             # Read and encode audio as base64
@@ -161,6 +164,15 @@ def mix_all(
                                 "error": "Output file not created"
                             }
                             yield json.dumps(result) + "\n"
+                    except concurrent.futures.TimeoutError:
+                        logger.error(f"TIMEOUT: {version_name} exceeded {VERSION_TIMEOUT}s – skipping.")
+                        result = {
+                            "version": version_name,
+                            "status": "failed",
+                            "progress": f"{current_progress}/4",
+                            "error": f"Processing timed out after {VERSION_TIMEOUT}s"
+                        }
+                        yield json.dumps(result) + "\n"
                     except Exception as e:
                         import traceback
                         logger.error(f"Error creating {version_name}: {e}\n{traceback.format_exc()}")

@@ -47,30 +47,44 @@ def detect_tempo(audio_path):
         logger.error(f"❌ Detect tempo thất bại: {e}\n{traceback.format_exc()}")
         return 120.0
 
+def safe_load_audio_segment(path, timeout=60):
+    """Load AudioSegment with a timeout to prevent hangs from pydub's internal ffmpeg call."""
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(AudioSegment.from_file, path)
+        return future.result(timeout=timeout)
+
 def get_mean_volume(audio_path):
     """Đo mean volume (dBFS) dùng PyDub."""
     try:
-        audio = AudioSegment.from_file(audio_path)
+        audio = safe_load_audio_segment(audio_path)
         return audio.dBFS
     except Exception as e:
         logger.error(f"❌ Đo volume thất bại: {e}\n{traceback.format_exc()}")
         return -16.0
 
-def run_ffmpeg(command):
-    """Chạy FFmpeg command và check success."""
+FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
+
+def run_ffmpeg(command, timeout=FFMPEG_TIMEOUT):
+    """Chạy FFmpeg command và check success, với timeout để tránh treo."""
     logger.info(f"Running ffmpeg command: {command}")
     try:
-        process = subprocess.run(command, shell=True, capture_output=True, text=True)
+        process = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=timeout
+        )
         if process.returncode != 0:
             logger.error(f"❌ FFmpeg failed (code {process.returncode}): {process.stderr}\nCommand: {command}")
             return False
         return True
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ FFmpeg TIMEOUT after {timeout}s – killed.\nCommand: {command}")
+        return False
     except Exception as e:
         logger.error(f"❌ Exception running FFmpeg: {e}\n{traceback.format_exc()}\nCommand: {command}")
         return False
 
 
-def adjust_bpm(input_path: str, output_path: str, speed_mode: str):
+def adjust_bpm
     """Adjust playback speed of an audio file using FFmpeg's atempo filter.
 
     The `speed_mode` may be one of the named presets or a numeric factor (as
@@ -210,7 +224,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -t {duration_seconds} "{normalized_picked_path}"')
         
         # Normalize Picked
-        picked_audio_seg = AudioSegment.from_file(normalized_picked_path).normalize()
+        picked_audio_seg = safe_load_audio_segment(normalized_picked_path).normalize()
         if picked_audio_seg.dBFS < -50: picked_audio_seg += 10
         picked_audio_seg.export(normalized_picked_path, format="wav")
 
@@ -288,7 +302,7 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
             run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -t {duration_seconds} "{trimmed_path}"')
         
         # Normalize Picked
-        picked_seg = AudioSegment.from_file(trimmed_path).normalize()
+        picked_seg = safe_load_audio_segment(trimmed_path).normalize()
         if picked_seg.dBFS < -20: picked_seg += 6
         picked_seg.export(normalized_picked_path, format="wav")
 
@@ -354,7 +368,7 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         time_stretch_heartbeat(denoised_path, stretched_path, music_tempo, heart_tempo)
 
         # Trim & Normalize
-        picked_seg = AudioSegment.from_file(stretched_path)
+        picked_seg = safe_load_audio_segment(stretched_path)
         adjusted_duration = heart_duration * (heart_tempo / music_tempo)
         picked_seg = picked_seg[:int(adjusted_duration * 1000)].normalize() - 14
         picked_seg.export(normalized_picked_path, format="wav")
@@ -416,7 +430,7 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         time_stretch_heartbeat(denoised_path, stretched_path, target_heartbeat_tempo, heart_tempo)
 
         # Trim & Normalize
-        picked_seg = AudioSegment.from_file(stretched_path)
+        picked_seg = safe_load_audio_segment(stretched_path)
         adjusted_duration_ms = (4 * (60.0 / target_heartbeat_tempo)) * 1000
         picked_seg = picked_seg[:int(adjusted_duration_ms)].normalize()
         if picked_seg.dBFS < -25: picked_seg += 3
