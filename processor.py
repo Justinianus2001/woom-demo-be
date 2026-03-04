@@ -288,21 +288,16 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         logger.info(f"[v1] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
         asset_filter = f"[0:a]volume={max(0, -diff)}dB[a0];"
-        # [THAY ĐỔI] BỎ aloop — heartbeat chạy liên tục tự nhiên, không loop đoạn ngắn
-        picked_filter = f"[1:a]volume={max(0, diff)}dB[a1];"
+        # [SỬA LỖI] Dùng aloop để loop TOÀN BỘ đoạn heartbeat tự nhiên, giúp mix đủ dài bằng nhạc nền
+        picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
 
-        # Fade-out mượt cuối bài (tránh kết thúc đột ngột)
-        fade_dur = min(2.0, heart_len_s / 5)
-        fade_st = max(0, heart_len_s - fade_dur)
-
-        # [THAY ĐỔI] duration=shortest → output = độ dài heartbeat (không kéo theo nhạc)
-        # [ĐẶC TRƯNG V1] weights=0.5 0.5 → heartbeat nổi bật nhất trong 4 version
+        # [SỬA LỖI] duration=first → output = độ dài nhạc nền (a0), amix tự ngắt khi nhạc nền hết
+        # [ĐẶC TRƯNG V1] weights=0.35 0.65 → heartbeat nổi bật nhất trong 4 version
         enc = codec_args(output_path)
         mix_filter = (
             f"{asset_filter}{picked_filter}"
-            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2"
-            f":weights=0.35 0.65[mixed];"  # Nhịp tim (0.65) to và rõ bám sát tai, nhạc nền nhẹ hơn (0.35)
-            f"[mixed]afade=t=out:st={fade_st:.2f}:d={fade_dur:.2f}[a]"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
+            f":weights=0.35 0.65[a]"  # Nhịp tim (0.65) to và rõ bám sát tai, nhạc nền nhẹ hơn (0.35)
         )
         if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{output_path}"'):
             logger.info(f"[v1] Finished successfully -> {output_path}")
@@ -383,18 +378,16 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         asset_filter = f"[0:a]volume={max(0, -diff)}dB[a0];"
         # [ĐẶC TRƯNG MỚI] Dùng reverb sâu hơn (500ms delay, decay 0.4) tạo không gian mênh mông như trong hang động
         # Kết hợp highpass(200Hz) nhẹ để gọt bỏ bớt tiếng bụp đục (âm trầm), tiếng đập mảnh hơn, thanh tao hơn
-        picked_filter = f"[1:a]volume={max(0, diff)}dB,highpass=f=200,aecho=0.8:0.9:500:0.4[a1];"
+        # [SỬA LỖI] Thêm aloop=loop=-1 ở cuối chuỗi của filter để nhịp tim không chạy hết sớm
+        picked_filter = f"[1:a]volume={max(0, diff)}dB,highpass=f=200,aecho=0.8:0.9:500:0.4,aloop=loop=-1:size=2e+09[a1];"
 
-        fade_dur = min(2.0, heart_len_s / 5)
-        fade_st = max(0, heart_len_s - fade_dur)
-
+        # [SỬA LỖI] duration=first → output dài bằng nhạc nền (a0)
         # [ĐẶC TRƯNG V2] weights=0.5 0.5 → Nhịp tim vang vọng hòa lẫn sâu vào nhạc, không áp đảo
         enc = codec_args(mixed_temp_path)
         mix_filter = (
             f"{asset_filter}{picked_filter}"
-            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2"
-            f":weights=0.65 0.35[mixed];"
-            f"[mixed]afade=t=out:st={fade_st:.2f}:d={fade_dur:.2f}[a]"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
+            f":weights=0.5 0.5[a]"
         )
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"')
 
@@ -478,18 +471,16 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
 
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
         # [ĐẶC TRƯNG MỚI] Tăng Treble (high EQ) cho nhịp tim để âm thanh sắc nét, dập rõ tiết tấu
-        picked_filter = f"[1:a]volume={max(0, diff)}dB,treble=g=5:f=1000[a1];"
+        # [SỬA LỖI] Thêm aloop=loop=-1
+        picked_filter = f"[1:a]volume={max(0, diff)}dB,treble=g=5:f=1000,aloop=loop=-1:size=2e+09[a1];"
 
-        fade_dur = min(2.0, heart_len_s / 5)
-        fade_st = max(0, heart_len_s - fade_dur)
-
+        # [SỬA LỖI] duration=first → output dài bằng nhạc nền (a0)
         # [ĐẶC TRƯNG V3] weights=0.7 0.3 → nhạc nổi bật, heartbeat là nhịp nền đồng bộ
         enc = codec_args(output_path)
         mix_filter = (
             f"{asset_filter}{picked_filter}"
-            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2"
-            f":weights=0.7 0.3[mixed];"
-            f"[mixed]afade=t=out:st={fade_st:.2f}:d={fade_dur:.2f}[a]"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
+            f":weights=0.7 0.3[a]"
         )
         if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{output_path}"'):
             logger.info(f"[v3] Finished successfully -> {output_path}")
@@ -569,19 +560,16 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         logger.info(f"[v4] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
         asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
-        # [THAY ĐỔI] BỎ aloop — heartbeat đã stretch chạy liên tục
-        picked_filter = f"[1:a]volume={max(0, diff)}dB[a1];"
+        # [SỬA LỖI] Phải dùng aloop để lặp lại heartbeat theo chiều dài bài hát
+        picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
 
-        fade_dur = min(2.0, heart_len_s / 5)
-        fade_st = max(0, heart_len_s - fade_dur)
-
+        # [SỬA LỖI] duration=first → dài bằng nhạc nền
         # weights=0.75 0.25 → cân bằng nhạc + heartbeat nhanh
         enc = codec_args(mixed_temp_path)
         mix_filter = (
             f"{asset_filter}{picked_filter}"
-            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2"
-            f":weights=0.7 0.3[mixed];"
-            f"[mixed]afade=t=out:st={fade_st:.2f}:d={fade_dur:.2f}[a]"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
+            f":weights=0.7 0.3[a]"
         )
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"')
 
