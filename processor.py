@@ -11,11 +11,26 @@ import soundfile as sf
 import logging
 import traceback
 
+def _check_lfs_pointer(path: str) -> bool:
+    """Check if the file is actually a Git LFS text pointer instead of real audio."""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(30)
+            if header.startswith(b"version https://git-lfs"):
+                return True
+    except Exception:
+        pass
+    return False
+
 logger = logging.getLogger(__name__)
 
 def _librosa_load_safe(audio_path: str, duration: float = 30.0):
     """Load audio via librosa, falling back to a temp WAV conversion if the
     file format is not recognised by libsndfile/audioread."""
+    if _check_lfs_pointer(audio_path):
+        logger.error(f"❌ '{audio_path}' is a Git LFS pointer, not actual audio data! Run 'git lfs pull' on your server.")
+        return np.array([]), 22050
+
     import tempfile as _tempfile
     # First, try direct load
     try:
@@ -30,10 +45,21 @@ def _librosa_load_safe(audio_path: str, duration: float = 30.0):
     tmp_path = tmp.name
     tmp.close()
     try:
-        # Try with explicit WAV demuxer first, then raw f32le
+        # Try with multiple demuxers
         converted = False
-        for extra in ["-f wav", "", "-f f32le -ar 44100 -ac 2", "-f s16le -ar 44100 -ac 2"]:
+        strategies = [
+            "-probesize 50M -analyzeduration 100M",
+            "-f mp3",
+            "-f mp4",
+            "-f flac",
+            "-f w64",
+            "",
+            "-f wav"
+        ]
+        for extra in strategies:
             cmd = f'ffmpeg -y {extra} -i "{audio_path}" -ar 44100 -ac 1 -sample_fmt s16 "{tmp_path}"'
+            # collapse multiple spaces
+            cmd = ' '.join(cmd.split())
             import subprocess as _sp, shlex as _shlex
             try:
                 result = _sp.run(_shlex.split(cmd), stdin=_sp.DEVNULL,
@@ -97,24 +123,32 @@ FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
 def preconvert_asset(asset_audio: str, output_path: str) -> bool:
     """Try multiple FFmpeg strategies to convert an asset audio file to a
     standard 44100Hz stereo PCM WAV.
-
-    The track files use Wave64 (w64) format — a 64-bit extension of RIFF WAV
+    """
+    if _check_lfs_pointer(asset_audio):
+        logger.error(f"❌ '{asset_audio}' is a Git LFS pointer, not actual audio data! Run 'git lfs pull' on your server.")
+        return False
     that uses a GUID-based header. This explains the ffmpeg error:
         [wav] "invalid start code vers in RIFF header"
 
     We try strategies in order of likelihood:
-    1. -f w64   → Wave64 demuxer (most likely for these files)
-    2. Auto     → let FFmpeg probe normally (works for standard WAV/MP3/etc.)
-    3. -f wav   → explicit WAV demuxer (handles some RF64 variants)
+    1. auto_large_probe → Increase probesize for huge ID3 tags
+    2. mp3/mp4/flac → Extremely common mislabeled formats (M4A/MP3 -> .wav)
+    3. w64      → Wave64 demuxer
+    4. Auto     → let FFmpeg probe normally
+    5. wav      → explicit WAV demuxer
 
     Raw PCM strategies (f32le, s16le, etc.) are intentionally EXCLUDED —
     they return rc=0 but produce silent/garbage audio because they misinterpret
-    the RIFF/W64 header bytes as raw sample data.
+    the headers as raw sample data.
 
     Returns True if any strategy succeeded AND the output has non-silent audio.
     """
     strategies = [
         # (label, extra input flags before -i)
+        ("auto_large_probe", "-probesize 50M -analyzeduration 100M"),
+        ("mp3",   "-f mp3"),
+        ("mp4",   "-f mp4"),
+        ("flac",  "-f flac"),
         ("w64",   "-f w64"),
         ("auto",  ""),
         ("wav",   "-f wav"),

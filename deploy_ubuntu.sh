@@ -3,6 +3,15 @@ set -e
 
 echo "Starting Woom Audio Mixer deployment for Ubuntu server..."
 
+# 1. Fetch real LFS audio files instead of text pointers
+echo "📥 Pulling Git LFS files..."
+if ! command -v git-lfs &> /dev/null; then
+    echo "Installing Git LFS..."
+    sudo apt-get update && sudo apt-get install -y git-lfs
+    git lfs install
+fi
+git lfs pull
+
 # 2. Build the Docker image
 echo "📦 Building the Docker image..."
 docker build -t woom-mixer .
