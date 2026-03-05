@@ -13,10 +13,52 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
+def _librosa_load_safe(audio_path: str, duration: float = 30.0):
+    """Load audio via librosa, falling back to a temp WAV conversion if the
+    file format is not recognised by libsndfile/audioread."""
+    import tempfile as _tempfile
+    # First, try direct load
+    try:
+        y, sr = librosa.load(audio_path, sr=None, duration=duration)
+        if len(y) > 0:
+            return y, sr
+    except Exception:
+        pass  # fall through to ffmpeg conversion
+
+    # Fallback: convert to standard PCM WAV via ffmpeg then load
+    tmp = _tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        # Try with explicit WAV demuxer first, then raw f32le
+        converted = False
+        for extra in ["-f wav", "", "-f f32le -ar 44100 -ac 2", "-f s16le -ar 44100 -ac 2"]:
+            cmd = f'ffmpeg -y {extra} -i "{audio_path}" -ar 44100 -ac 1 -sample_fmt s16 "{tmp_path}"'
+            import subprocess as _sp, shlex as _shlex
+            try:
+                result = _sp.run(_shlex.split(cmd), stdin=_sp.DEVNULL,
+                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=60)
+                if result.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    converted = True
+                    break
+            except Exception:
+                pass
+        if converted:
+            y, sr = librosa.load(tmp_path, sr=None, duration=duration)
+            return y, sr
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return np.array([]), 22050
+
+
 def calculate_duration_from_analysis(picked_audio, num_beats=4):
     """Phân tích file để lấy duration chính xác cho N nhịp tim."""
     try:
-        y, sr = librosa.load(picked_audio, sr=None, duration=30.0)
+        y, sr = _librosa_load_safe(picked_audio, duration=30.0)
         if len(y) == 0:
             return None, 120.0
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
@@ -35,7 +77,7 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
 def detect_tempo(audio_path):
     """Tự detect tempo của file audio dùng Librosa."""
     try:
-        y, sr = librosa.load(audio_path, sr=None, duration=60.0)
+        y, sr = _librosa_load_safe(audio_path, duration=60.0)
         if len(y) == 0:
             return 120.0
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
@@ -50,6 +92,54 @@ def detect_tempo(audio_path):
         return 120.0
 
 FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
+
+
+def preconvert_asset(asset_audio: str, output_path: str) -> bool:
+    """Try multiple FFmpeg strategies to convert an asset audio file to a
+    standard 44100Hz stereo PCM WAV.
+
+    Some track files shipped with the app use non-standard WAV variants
+    (Wave64 / RF64 / float-32 PCM / ADPCM / etc.) that libsndfile and newer
+    FFmpeg refuse to auto-detect.  We attempt several fallback strategies:
+
+    1. Auto-detect (let FFmpeg probe normally)
+    2. Force -f wav  (explicit demuxer, handles RF64/W64 mis-labelled as wav)
+    3. Force -f f32le / f32be  (float-32 raw PCM, no header)
+    4. Force -f s16le / s16be  (16-bit signed raw PCM, no header)
+    5. Force -f s24le          (24-bit signed raw PCM)
+
+    Returns True if any strategy succeeded and `output_path` was created.
+    """
+    strategies = [
+        # (label, extra input flags)
+        ("auto",   ""),
+        ("wav",    "-f wav"),
+        ("f32le",  "-f f32le -ar 44100 -ac 2"),
+        ("f32be",  "-f f32be -ar 44100 -ac 2"),
+        ("s16le",  "-f s16le -ar 44100 -ac 2"),
+        ("s16be",  "-f s16be -ar 44100 -ac 2"),
+        ("s24le",  "-f s24le -ar 44100 -ac 2"),
+    ]
+    for label, extra in strategies:
+        cmd = f'ffmpeg -y {extra} -i "{asset_audio}" -ar 44100 -ac 2 -sample_fmt s16 "{output_path}"'
+        if run_ffmpeg(cmd):
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                logger.info(f"[preconvert_asset] Success with strategy '{label}'")
+                return True
+            # file created but empty – remove and try next strategy
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+        else:
+            # ensure partial file is cleaned up
+            if os.path.exists(output_path):
+                try:
+                    os.unlink(output_path)
+                except OSError:
+                    pass
+    logger.error(f"[preconvert_asset] All strategies failed for '{asset_audio}'")
+    return False
 
 def safe_ffmpeg_load(path, timeout=FFMPEG_TIMEOUT):
     """Load audio file as AudioSegment by converting to WAV via our controlled
@@ -278,7 +368,12 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         logger.info(f"[v1] Normalized heartbeat: duration={heart_len_s:.1f}s")
 
         # === NHẠC NỀN: Giữ nguyên tempo, chỉ normalize -> bỏ tempo
-        run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+        # Pre-convert asset to standard PCM WAV first (handles Wave64/RF64/float variants)
+        raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
+        if not preconvert_asset(asset_audio, raw_asset_path):
+            logger.error(f"[v1] Cannot decode asset audio '{asset_audio}', aborting.")
+            return
+        run_ffmpeg(f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
         logger.info(f"[v1] Normalized asset: {normalized_asset_path}")
 
         # Mix
@@ -366,7 +461,12 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
 
         # === NHẠC NỀN: Giữ nguyên tempo ===
         # [THAY ĐỔI] BỎ asset stretch — tempo_factor luôn = 1.0 (code thừa)
-        run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+        # Pre-convert asset to standard PCM WAV first (handles Wave64/RF64/float variants)
+        raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
+        if not preconvert_asset(asset_audio, raw_asset_path):
+            logger.error(f"[v2] Cannot decode asset audio '{asset_audio}', aborting.")
+            return
+        run_ffmpeg(f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
         logger.info(f"[v2] Normalized asset: {normalized_asset_path}")
 
         # Mix
@@ -458,8 +558,13 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         tempo_rate = max(0.5, min(2.0, tempo_rate))  # Clamp tránh FFmpeg atempo quá extreme
         logger.info(f"[v3] Stretching music: rate={tempo_rate:.3f} (heart={heart_tempo:.0f} / music={music_tempo:.0f})")
 
+        # Pre-convert asset to standard PCM WAV first (handles Wave64/RF64/float variants)
+        raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
+        if not preconvert_asset(asset_audio, raw_asset_path):
+            logger.error(f"[v3] Cannot decode asset audio '{asset_audio}', aborting.")
+            return
         atempo_str = get_atempo_filter(tempo_rate)
-        run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -filter:a "{atempo_str}" "{stretched_asset_path}"')
+        run_ffmpeg(f'ffmpeg -y -i "{raw_asset_path}" -filter:a "{atempo_str}" "{stretched_asset_path}"')
         run_ffmpeg(f'ffmpeg -y -i "{stretched_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
         logger.info(f"[v3] Normalized stretched asset: {normalized_asset_path}")
 
@@ -550,7 +655,12 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         logger.info(f"[v4] Normalized stretched heartbeat: duration={heart_len_s:.1f}s")
 
         # === NHẠC NỀN: Giữ nguyên tempo ===
-        run_ffmpeg(f'ffmpeg -y -i "{asset_audio}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
+        # Pre-convert asset to standard PCM WAV first (handles Wave64/RF64/float variants)
+        raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
+        if not preconvert_asset(asset_audio, raw_asset_path):
+            logger.error(f"[v4] Cannot decode asset audio '{asset_audio}', aborting.")
+            return
+        run_ffmpeg(f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
         logger.info(f"[v4] Normalized asset: {normalized_asset_path}")
 
         # Mix
