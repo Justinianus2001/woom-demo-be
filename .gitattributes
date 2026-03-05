@@ -1,0 +1,2 @@
+tracks/*.wav filter=lfs diff=lfs merge=lfs -text
+tracks/*.mp3 filter=lfs diff=lfs merge=lfs -text
