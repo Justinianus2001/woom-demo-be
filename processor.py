@@ -98,48 +98,80 @@ def preconvert_asset(asset_audio: str, output_path: str) -> bool:
     """Try multiple FFmpeg strategies to convert an asset audio file to a
     standard 44100Hz stereo PCM WAV.
 
-    Some track files shipped with the app use non-standard WAV variants
-    (Wave64 / RF64 / float-32 PCM / ADPCM / etc.) that libsndfile and newer
-    FFmpeg refuse to auto-detect.  We attempt several fallback strategies:
+    The track files use Wave64 (w64) format — a 64-bit extension of RIFF WAV
+    that uses a GUID-based header. This explains the ffmpeg error:
+        [wav] "invalid start code vers in RIFF header"
 
-    1. Auto-detect (let FFmpeg probe normally)
-    2. Force -f wav  (explicit demuxer, handles RF64/W64 mis-labelled as wav)
-    3. Force -f f32le / f32be  (float-32 raw PCM, no header)
-    4. Force -f s16le / s16be  (16-bit signed raw PCM, no header)
-    5. Force -f s24le          (24-bit signed raw PCM)
+    We try strategies in order of likelihood:
+    1. -f w64   → Wave64 demuxer (most likely for these files)
+    2. Auto     → let FFmpeg probe normally (works for standard WAV/MP3/etc.)
+    3. -f wav   → explicit WAV demuxer (handles some RF64 variants)
 
-    Returns True if any strategy succeeded and `output_path` was created.
+    Raw PCM strategies (f32le, s16le, etc.) are intentionally EXCLUDED —
+    they return rc=0 but produce silent/garbage audio because they misinterpret
+    the RIFF/W64 header bytes as raw sample data.
+
+    Returns True if any strategy succeeded AND the output has non-silent audio.
     """
     strategies = [
-        # (label, extra input flags)
-        ("auto",   ""),
-        ("wav",    "-f wav"),
-        ("f32le",  "-f f32le -ar 44100 -ac 2"),
-        ("f32be",  "-f f32be -ar 44100 -ac 2"),
-        ("s16le",  "-f s16le -ar 44100 -ac 2"),
-        ("s16be",  "-f s16be -ar 44100 -ac 2"),
-        ("s24le",  "-f s24le -ar 44100 -ac 2"),
+        # (label, extra input flags before -i)
+        ("w64",   "-f w64"),
+        ("auto",  ""),
+        ("wav",   "-f wav"),
     ]
     for label, extra in strategies:
-        cmd = f'ffmpeg -y {extra} -i "{asset_audio}" -ar 44100 -ac 2 -sample_fmt s16 "{output_path}"'
+        cmd = f'ffmpeg -y {extra} -i "{asset_audio}" -ar 44100 -ac 2 -sample_fmt s16 "{output_path}"'.strip()
+        # Collapse double spaces that appear when extra == ""
+        cmd = ' '.join(cmd.split())
         if run_ffmpeg(cmd):
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                logger.info(f"[preconvert_asset] Success with strategy '{label}'")
-                return True
-            # file created but empty – remove and try next strategy
+            if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+                logger.warning(f"[preconvert_asset] Strategy '{label}' produced empty file, skipping.")
+                _try_unlink(output_path)
+                continue
+            # Validate: make sure the audio actually has signal (not all-zero silence)
             try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+                data, _ = sf.read(output_path, frames=8192)
+                rms = float(np.sqrt(np.mean(data ** 2))) if len(data) > 0 else 0.0
+                if rms < 1e-6:
+                    logger.warning(
+                        f"[preconvert_asset] Strategy '{label}' produced silent audio "
+                        f"(RMS={rms:.2e}), likely wrong format — skipping."
+                    )
+                    _try_unlink(output_path)
+                    continue
+            except Exception as val_err:
+                logger.warning(f"[preconvert_asset] Validation failed for strategy '{label}': {val_err}")
+                _try_unlink(output_path)
+                continue
+            logger.info(f"[preconvert_asset] Success with strategy '{label}' (RMS={rms:.4f})")
+            return True
         else:
-            # ensure partial file is cleaned up
-            if os.path.exists(output_path):
-                try:
-                    os.unlink(output_path)
-                except OSError:
-                    pass
+            _try_unlink(output_path)
     logger.error(f"[preconvert_asset] All strategies failed for '{asset_audio}'")
     return False
+
+
+def _try_unlink(path: str) -> None:
+    """Silently remove a file if it exists."""
+    if os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def safe_db(value: float, fallback: float = 0.0, limit: float = 40.0) -> float:
+    """Return a finite, non-extreme dB value safe to use in an FFmpeg filter.
+
+    Protects against:
+    - math.inf / float('inf')  => would produce 'volume=infdB' (invalid)
+    - float('nan')             => would produce 'volume=nandB'  (invalid)
+    - Values > +limit dB       => excessive gain, likely a measurement mistake
+    """
+    import math
+    if value is None or math.isnan(value) or math.isinf(value):
+        return fallback
+    return max(-limit, min(limit, value))
 
 def safe_ffmpeg_load(path, timeout=FFMPEG_TIMEOUT):
     """Load audio file as AudioSegment by converting to WAV via our controlled
@@ -382,9 +414,9 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         diff = vol_asset - vol_picked
         logger.info(f"[v1] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]volume={max(0, -diff)}dB[a0];"
+        asset_filter = f"[0:a]volume={safe_db(max(0, -diff))}dB[a0];"
         # [SỬA LỖI] Dùng aloop để loop TOÀN BỘ đoạn heartbeat tự nhiên, giúp mix đủ dài bằng nhạc nền
-        picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+        picked_filter = f"[1:a]volume={safe_db(max(0, diff))}dB,aloop=loop=-1:size=2e+09[a1];"
 
         # [SỬA LỖI] duration=first → output = độ dài nhạc nền (a0), amix tự ngắt khi nhạc nền hết
         # [ĐẶC TRƯNG V1] weights=0.35 0.65 → heartbeat nổi bật nhất trong 4 version
@@ -475,11 +507,11 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         diff = vol_asset - vol_picked
         logger.info(f"[v2] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]volume={max(0, -diff)}dB[a0];"
+        asset_filter = f"[0:a]volume={safe_db(max(0, -diff))}dB[a0];"
         # [ĐẶC TRƯNG MỚI] Dùng reverb sâu hơn (500ms delay, decay 0.4) tạo không gian mênh mông như trong hang động
         # Kết hợp highpass(200Hz) nhẹ để gọt bỏ bớt tiếng bụp đục (âm trầm), tiếng đập mảnh hơn, thanh tao hơn
         # [SỬA LỖI] Thêm aloop=loop=-1 ở cuối chuỗi của filter để nhịp tim không chạy hết sớm
-        picked_filter = f"[1:a]volume={max(0, diff)}dB,highpass=f=200,aecho=0.8:0.9:500:0.4,aloop=loop=-1:size=2e+09[a1];"
+        picked_filter = f"[1:a]volume={safe_db(max(0, diff))}dB,highpass=f=200,aecho=0.8:0.9:500:0.4,aloop=loop=-1:size=2e+09[a1];"
 
         # [SỬA LỖI] duration=first → output dài bằng nhạc nền (a0)
         # [ĐẶC TRƯNG V2] weights=0.5 0.5 → Nhịp tim vang vọng hòa lẫn sâu vào nhạc, không áp đảo
@@ -492,7 +524,10 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"')
 
         # [ĐẶC TRƯNG V2] 432Hz tuning — tần số ấm áp, thư giãn hơn 440Hz
-        tune_to_432hz(mixed_temp_path, output_path)
+        if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
+            logger.error(f"[v2] mixed_temp.mp3 is empty or missing, aborting 432Hz step.")
+        else:
+            tune_to_432hz(mixed_temp_path, output_path)
         logger.info(f"[v2] Finished successfully -> {output_path}")
     except Exception as e:
         logger.error(f"[v2] Error during mix_audio_v2: {e}\n{traceback.format_exc()}")
@@ -574,10 +609,10 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         diff = vol_asset - vol_picked
         logger.info(f"[v3] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
+        asset_filter = f"[0:a]volume={safe_db(max(0, -diff + 2))}dB[a0];"
         # [ĐẶC TRƯNG MỚI] Tăng Treble (high EQ) cho nhịp tim để âm thanh sắc nét, dập rõ tiết tấu
         # [SỬA LỖI] Thêm aloop=loop=-1
-        picked_filter = f"[1:a]volume={max(0, diff)}dB,treble=g=5:f=1000,aloop=loop=-1:size=2e+09[a1];"
+        picked_filter = f"[1:a]volume={safe_db(max(0, diff))}dB,treble=g=5:f=1000,aloop=loop=-1:size=2e+09[a1];"
 
         # [SỬA LỖI] duration=first → output dài bằng nhạc nền (a0)
         # [ĐẶC TRƯNG V3] weights=0.7 0.3 → nhạc nổi bật, heartbeat là nhịp nền đồng bộ
@@ -669,9 +704,9 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         diff = vol_asset - vol_picked
         logger.info(f"[v4] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]volume={max(0, -diff + 2)}dB[a0];"
+        asset_filter = f"[0:a]volume={safe_db(max(0, -diff + 2))}dB[a0];"
         # [SỬA LỖI] Phải dùng aloop để lặp lại heartbeat theo chiều dài bài hát
-        picked_filter = f"[1:a]volume={max(0, diff)}dB,aloop=loop=-1:size=2e+09[a1];"
+        picked_filter = f"[1:a]volume={safe_db(max(0, diff))}dB,aloop=loop=-1:size=2e+09[a1];"
 
         # [SỬA LỖI] duration=first → dài bằng nhạc nền
         # weights=0.75 0.25 → cân bằng nhạc + heartbeat nhanh
@@ -684,7 +719,10 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"')
 
         # [ĐẶC TRƯNG V4] 432Hz tuning — ấm áp + nhịp nhanh
-        tune_to_432hz(mixed_temp_path, output_path)
+        if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
+            logger.error(f"[v4] mixed_temp.mp3 is empty or missing, aborting 432Hz step.")
+        else:
+            tune_to_432hz(mixed_temp_path, output_path)
         logger.info(f"[v4] Finished successfully -> {output_path}")
     except Exception as e:
         logger.error(f"[v4] Error during mix_audio_v4: {e}\n{traceback.format_exc()}")
