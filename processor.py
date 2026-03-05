@@ -123,10 +123,8 @@ FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
 def preconvert_asset(asset_audio: str, output_path: str) -> bool:
     """Try multiple FFmpeg strategies to convert an asset audio file to a
     standard 44100Hz stereo PCM WAV.
-    """
-    if _check_lfs_pointer(asset_audio):
-        logger.error(f"❌ '{asset_audio}' is a Git LFS pointer, not actual audio data! Run 'git lfs pull' on your server.")
-        return False
+    
+    The track files might use Wave64 (w64) format — a 64-bit extension of RIFF WAV
     that uses a GUID-based header. This explains the ffmpeg error:
         [wav] "invalid start code vers in RIFF header"
 
@@ -143,6 +141,9 @@ def preconvert_asset(asset_audio: str, output_path: str) -> bool:
 
     Returns True if any strategy succeeded AND the output has non-silent audio.
     """
+    if _check_lfs_pointer(asset_audio):
+        logger.error(f"❌ '{asset_audio}' is a Git LFS pointer, not actual audio data! Run 'git lfs pull' on your server.")
+        return False
     strategies = [
         # (label, extra input flags before -i)
         ("auto_large_probe", "-probesize 50M -analyzeduration 100M"),
