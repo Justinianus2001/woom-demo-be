@@ -9,7 +9,7 @@ import logging
 import base64
 import json
 from typing import List
-from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm
+from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm, preprocess_shared
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -104,14 +104,25 @@ def mix_all(
         logger.info("Analyzing audio tracks...")
         heart_duration, heart_tempo = calculate_duration_from_analysis(picked_path)
         music_tempo = detect_tempo(asset_path)
+
+        # === TỐI ƯU: Tiền xử lý chung 1 lần cho cả 4 versions ===
+        # Bỏ preconvert_asset ×4, convert picked ×4, loudnorm ×4, get_mean_volume ×8
+        # → Giảm ~40 FFmpeg subprocess spawns
+        logger.info("Running shared preprocessing (preconvert + loudnorm + WAV convert)...")
+        shared_data = preprocess_shared(asset_path, picked_path, temp_dir)
+        if not shared_data.get('success'):
+            logger.error("Shared preprocessing failed — versions will fallback to individual processing")
+            shared_data = None
+        else:
+            logger.info(f"Shared preprocessing complete. Asset volume: {shared_data['asset_volume']:.1f}dB")
         
         # Define mixing functions and implementations
-        # Each version now receives the shared analysis results
+        # Each version now receives the shared analysis results + shared preprocessed data
         versions = [
-            ("v1", mix_audio_v1, {"heart_duration": heart_duration}),
-            ("v2", mix_audio_v2, {"heart_duration": heart_duration}),
-            ("v3", mix_audio_v3, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo}),
-            ("v4", mix_audio_v4, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo}),
+            ("v1", mix_audio_v1, {"heart_duration": heart_duration, "shared_data": shared_data}),
+            ("v2", mix_audio_v2, {"heart_duration": heart_duration, "shared_data": shared_data}),
+            ("v3", mix_audio_v3, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo, "shared_data": shared_data}),
+            ("v4", mix_audio_v4, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo, "shared_data": shared_data}),
         ]
         
         # Maximum time (seconds) allowed for a single version to finish processing
