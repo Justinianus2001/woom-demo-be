@@ -260,7 +260,7 @@ def fast_mean_volume(wav_path: str) -> float:
 
 
 def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
-    """Tiền xử lý chung cho cả 4 versions — chỉ chạy MỘT LẦN.
+    """Tiền xử lý chung cho cả 3 versions — chỉ chạy MỘT LẦN.
 
     Thực hiện:
     1. Pre-convert asset audio → PCM WAV chuẩn (handles Wave64/RF64/float/m4a/mp3...)
@@ -535,7 +535,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         diff = vol_asset - vol_picked
         logger.info(f"[v1] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]volume={safe_db(max(0, -diff))}dB[a0];"
+        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff))}dB[a0];"
         # [SỬA LỖI] Dùng aloop để loop TOÀN BỘ đoạn heartbeat tự nhiên, giúp mix đủ dài bằng nhạc nền
         picked_filter = f"[1:a]volume={safe_db(max(0, diff))}dB,aloop=loop=-1:size=2e+09[a1];"
 
@@ -645,7 +645,7 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         diff = vol_asset - vol_picked
         logger.info(f"[v2] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]volume={safe_db(max(0, -diff))}dB[a0];"
+        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff))}dB[a0];"
 
         picked_filter = (
             f"[1:a]"
@@ -759,7 +759,7 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
         diff = vol_asset - vol_picked
         logger.info(f"[v3] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]volume={safe_db(max(0, -diff + 2))}dB[a0];"
+        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff + 2))}dB[a0];"
 
         picked_filter = (
             f"[1:a]"
