@@ -9,7 +9,7 @@ import logging
 import base64
 import json
 from typing import List
-from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, mix_audio_v4, adjust_bpm
+from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, adjust_bpm, preprocess_shared
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -104,14 +104,24 @@ def mix_all(
         logger.info("Analyzing audio tracks...")
         heart_duration, heart_tempo = calculate_duration_from_analysis(picked_path)
         music_tempo = detect_tempo(asset_path)
+
+        # === TỐI ƯU: Tiền xử lý chung 1 lần cho cả 3 versions ===
+        # Bỏ preconvert_asset ×3, convert picked ×3, loudnorm ×3, get_mean_volume ×6
+        # → Giảm ~30 FFmpeg subprocess spawns
+        logger.info("Running shared preprocessing (preconvert + loudnorm + WAV convert)...")
+        shared_data = preprocess_shared(asset_path, picked_path, temp_dir)
+        if not shared_data.get('success'):
+            logger.error("Shared preprocessing failed — versions will fallback to individual processing")
+            shared_data = None
+        else:
+            logger.info(f"Shared preprocessing complete. Asset volume: {shared_data['asset_volume']:.1f}dB")
         
         # Define mixing functions and implementations
-        # Each version now receives the shared analysis results
+        # Each version now receives the shared analysis results + shared preprocessed data
         versions = [
-            ("v1", mix_audio_v1, {"heart_duration": heart_duration}),
-            ("v2", mix_audio_v2, {"heart_duration": heart_duration}),
-            ("v3", mix_audio_v3, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo}),
-            ("v4", mix_audio_v4, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo}),
+            ("v1", mix_audio_v1, {"heart_duration": heart_duration, "shared_data": shared_data}),
+            ("v2", mix_audio_v2, {"heart_duration": heart_duration, "shared_data": shared_data}),
+            ("v3", mix_audio_v3, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo, "shared_data": shared_data}),
         ]
         
         # Maximum time (seconds) allowed for a single version to finish processing
@@ -134,7 +144,7 @@ def mix_all(
                     logger.info(f"Submitting {version_name}...")
                     futures[executor.submit(mix_func, asset_path, picked_path, out_path, **extra_args)] = version_name
                 
-                for future in concurrent.futures.as_completed(futures, timeout=VERSION_TIMEOUT * 4):
+                for future in concurrent.futures.as_completed(futures, timeout=VERSION_TIMEOUT * 3):
                     version_name = futures[future]
                     with finished_lock:
                         finished_count += 1
@@ -150,17 +160,17 @@ def mix_all(
                             result = {
                                 "version": version_name,
                                 "status": "done",
-                                "progress": f"{current_progress}/4",
+                                "progress": f"{current_progress}/3",
                                 "data": audio_data
                             }
                             yield json.dumps(result) + "\n"
-                            logger.info(f"Streamed {version_name} (Progress: {current_progress}/4)")
+                            logger.info(f"Streamed {version_name} (Progress: {current_progress}/3)")
                         else:
                             logger.warning(f"File {version_name} was not created or is empty.")
                             result = {
                                 "version": version_name,
                                 "status": "failed",
-                                "progress": f"{current_progress}/4",
+                                "progress": f"{current_progress}/3",
                                 "error": "Output file not created"
                             }
                             yield json.dumps(result) + "\n"
@@ -169,7 +179,7 @@ def mix_all(
                         result = {
                             "version": version_name,
                             "status": "failed",
-                            "progress": f"{current_progress}/4",
+                            "progress": f"{current_progress}/3",
                             "error": f"Processing timed out after {VERSION_TIMEOUT}s"
                         }
                         yield json.dumps(result) + "\n"
@@ -179,7 +189,7 @@ def mix_all(
                         result = {
                             "version": version_name,
                             "status": "failed",
-                            "progress": f"{current_progress}/4",
+                            "progress": f"{current_progress}/3",
                             "error": str(e)
                         }
                         yield json.dumps(result) + "\n"
