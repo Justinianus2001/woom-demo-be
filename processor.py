@@ -535,29 +535,23 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         diff = vol_asset - vol_picked
         logger.info(f"[v1] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff))}dB[a0];"
-        # [SỬA LỖI] Dùng aloop để loop TOÀN BỘ đoạn heartbeat tự nhiên, giúp mix đủ dài bằng nhạc nền
-        picked_filter = f"[1:a]volume={safe_db(max(0, diff))}dB,aloop=loop=-1:size=2e+09[a1];"
-
-        # [SỬA LỖI] duration=first → output = độ dài nhạc nền (a0), amix tự ngắt khi nhạc nền hết
-        # [ĐẶC TRƯNG V1]
+        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff) - 3)}dB[a0];"
+        # Heartbeat: giữ nguyên tự nhiên, loop theo chiều dài nhạc nền
+        # [FIX] Cấp size chính xác cho aloop để loop đúng duration của file
+        picked_filter = f"[1:a]volume={safe_db(max(0, diff) + 4)}dB,aloop=loop=-1:size={int(heart_len_s * 44100)}[a1];"
 
         enc = codec_args(output_path)
         mix_filter = (
             f"{asset_filter}{picked_filter}"
-            ## Cắt tần số dưới 50Hz -> bỏ bass dư
-            ## Giảm noise nền của nhịp tim
-            ## Giảm peak -> nghe đằm hơn
-            ## Giảm nhẹ âm lượng của nhịp tim
-            f"[a1]highpass=f=50,afftdn=nf=-25,acompressor=threshold=-18dB:ratio=3,volume=0.8[a1clean];"
+            
+            # KHÔNG compress mạnh, KHÔNG giảm volume — giữ nguyên cảm giác tự nhiên
+            f"[a1]highpass=f=80,lowpass=f=250,afftdn=nf=-20[a1clean];"
 
-            ## Giảm nhẹ nhạc nền
-            f"[a0]volume=0.9[a0clean];"
+            # Nhạc nền: giảm dải tần 60-200Hz (trùng với heartbeat) để heartbeat nổi lên
+            f"[a0]equalizer=f=100:width_type=o:width=2:g=-4[a0clean];"
 
-            ## Mix nhạc nền và nhịp tim
-            ## Cân bằng nhịp tim và nhạc nền
-            ## limiter tránh clipping sau khi mix
-            f"[a0clean][a1clean]amix=inputs=2:duration=first:dropout_transition=2:weights=0.5 0.5,"
+            # Mix: heartbeat 55% / nhạc nền 45% → heartbeat nghe rõ nhưng vẫn có nhạc nền
+            f"[a0clean][a1clean]amix=inputs=2:duration=first:dropout_transition=2:weights=0.45 0.55,"
             f"alimiter=limit=0.9[a]"
         )
         # FFmpeg call #2 — final mix
@@ -633,38 +627,46 @@ def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, targe
         run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -af silenceremove=start_periods=1:start_duration=0:start_threshold={threshold_db}dB:detection=peak "{silenced_path}"')
         logger.info(f"[v2] Removed silence: {silenced_path}")
 
-        # Normalize heartbeat — pydub direct WAV load (0 subprocess)
-        picked_seg = AudioSegment.from_file(silenced_path, format='wav').normalize()
-        if picked_seg.dBFS < -20: picked_seg += 6
+        # Normalize heartbeat — RMS-based normalization thay vì peak-only
+        # Vấn đề: HPSS tạo signal sparse (chỉ có impulse nhịp) → peak normalize không đủ
+        # RMS target -12dBFS → heartbeat nghe rõ hơn trong mix
+        picked_seg = AudioSegment.from_file(silenced_path, format="wav").normalize()
+        # Sau peak normalize, nếu RMS vẫn thấp (signal sparse), boost thêm đến target -12dBFS
+        target_rms_dbfs = -12.0
+        if picked_seg.dBFS < target_rms_dbfs:
+            boost = target_rms_dbfs - picked_seg.dBFS
+            picked_seg = picked_seg + min(boost, 18.0)  # cap 18dB tránh noise explosion
+            logger.info(f"[v2] RMS boost applied: +{min(boost, 18.0):.1f}dB (dBFS was {picked_seg.dBFS - min(boost, 18.0):.1f})")
         picked_seg.export(normalized_picked_path, format="wav")
         heart_len_s = len(picked_seg) / 1000.0
-        logger.info(f"[v2] Normalized heartbeat: duration={heart_len_s:.1f}s")
+        logger.info(f"[v2] Normalized heartbeat: duration={heart_len_s:.1f}s, dBFS={picked_seg.dBFS:.1f}")
 
         # Đo volume — numpy direct (0 subprocess)
         vol_picked = fast_mean_volume(normalized_picked_path)
         diff = vol_asset - vol_picked
         logger.info(f"[v2] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
 
-        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff))}dB[a0];"
+        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff) - 3)}dB[a0];"
 
         picked_filter = (
             f"[1:a]"
-            f"volume={safe_db(max(10, diff+8))}dB," # Boost Heartbeat
-            f"highpass=f=20,lowpass=f=200,bass=g=6:f=80,"
-            f"acompressor=threshold=-24dB:ratio=2:attack=5:release=80," # giảm peak
-            f"volume=4dB,"
-            f"stereowiden=delay=8,"
-            f"aloop=loop=-1:size=2e+09"
+            f"highpass=f=40,lowpass=f=250,"            # Chặt hơn: 40-250Hz, loại bỏ hoàn toàn tần số giọng người
+            f"bass=g=5:f=80,"                          # Tăng nhẹ bass 80Hz (tần số tâm thu)
+            f"volume={safe_db(max(2, diff+2) + 8)}dB,"   # +8dB (tăng từ +6) → nghe rõ hơn 20% còn thiếu
+            f"acompressor=threshold=-18dB:ratio=1.5:attack=10:release=120,"  # Nén rất nhẹ, giữ dynamic tự nhiên
+            f"stereowiden=delay=6,"
+            f"aloop=loop=-1:size={int(heart_len_s * 44100)}"
             f"[a1];"
         )
 
-        # [SỬA LỖI] duration=first → output dài bằng nhạc nền (a0)
-        # [ĐẶC TRƯNG V2] weights=0.5 0.5 → Nhịp tim vang vọng hòa lẫn sâu vào nhạc, không áp đảo
+        # [ĐẶC TRƯNG V2] weights: nhạc nền 35% / heartbeat 65%
         enc = codec_args(mixed_temp_path)
         mix_filter = (
             f"{asset_filter}{picked_filter}"
-            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
-            f":weights=0.25 0.75,"                     # heartbeat rõ hơn
+            # Giảm dải mid nhạc nền để heartbeat không bị che
+            f"[a0]equalizer=f=100:width_type=o:width=2:g=-5[a0clean];"
+            f"[a0clean][a1]amix=inputs=2:duration=first:dropout_transition=2"
+            f":weights=0.45 0.55,"
             f"alimiter=limit=0.9[a]"
         )
         # FFmpeg call #2 — mix
@@ -763,10 +765,14 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
 
         picked_filter = (
             f"[1:a]"
-            f"volume={safe_db(max(0, diff + 2))}dB,"
+            f"volume={safe_db(max(10, diff + 12))}dB,"
+            f"highpass=f=120,lowpass=f=400,"
             f"bass=g=5:f=80,"
-            f"treble=g=4:f=3500,"
+            # f"treble=g=4:f=3500,"
             f"acompressor=threshold=-24dB:ratio=2:attack=5:release=80,"
+            f"aecho=0.8:0.7:40|80:0.25|0.15,"
+            # extrastereo: mở rộng stereo field (m=1.6) → nhịp tim lan toả không gian
+            f"extrastereo=m=1.6,"
             f"aloop=loop=-1:size=2e+09"
             f"[a1];"
         )
@@ -777,7 +783,7 @@ def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, he
             f"{asset_filter}{picked_filter}"
             f"[a0][a1]"
             f"amix=inputs=2:duration=first:dropout_transition=2"
-            f":weights=0.6 0.4,"
+            f":weights=0.3 0.7,"
             f"alimiter=limit=0.9"
             f"[a]"
         )
@@ -898,4 +904,3 @@ def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, he
         raise
     finally:
         temp_dir_obj.cleanup()
-
