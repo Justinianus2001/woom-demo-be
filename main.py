@@ -9,7 +9,8 @@ import logging
 import base64
 import json
 from typing import List
-from processor import mix_audio_v1, mix_audio_v2, mix_audio_v3, adjust_bpm, preprocess_shared
+# v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
+from processor import mix_audio_v1, adjust_bpm, preprocess_shared
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -116,83 +117,53 @@ def mix_all(
         else:
             logger.info(f"Shared preprocessing complete. Asset volume: {shared_data['asset_volume']:.1f}dB")
         
-        # Define mixing functions and implementations
-        # Each version now receives the shared analysis results + shared preprocessed data
-        versions = [
-            ("v1", mix_audio_v1, {"heart_duration": heart_duration, "shared_data": shared_data}),
-            ("v2", mix_audio_v2, {"heart_duration": heart_duration, "shared_data": shared_data}),
-            ("v3", mix_audio_v3, {"heart_duration": heart_duration, "heart_tempo": heart_tempo, "music_tempo": music_tempo, "shared_data": shared_data}),
-        ]
-        
-        # Maximum time (seconds) allowed for a single version to finish processing
-        VERSION_TIMEOUT = 300
-
         def generate_results():
-            """Generator that yields JSON lines as each version completes."""
-            import concurrent.futures
-            import threading
-            
-            # Atomic counter to track finished tasks correctly
-            finished_lock = threading.Lock()
-            finished_count = 0
+            """Generator that yields a single JSON line for the unified v1 pipeline."""
+            version_name = "v1"
+            out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
+            logger.info("Submitting unified v1 pipeline...")
 
-            # Process 2 versions at a time to limit peak CPU usage
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {}
-                for version_name, mix_func, extra_args in versions:
-                    out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
-                    logger.info(f"Submitting {version_name}...")
-                    futures[executor.submit(mix_func, asset_path, picked_path, out_path, **extra_args)] = version_name
-                
-                for future in concurrent.futures.as_completed(futures, timeout=VERSION_TIMEOUT * 3):
-                    version_name = futures[future]
-                    with finished_lock:
-                        finished_count += 1
-                        current_progress = finished_count
+            try:
+                mix_audio_v1(
+                    asset_path,
+                    picked_path,
+                    out_path,
+                    heart_duration=heart_duration,
+                    heart_tempo=heart_tempo,
+                    music_tempo=music_tempo,
+                    shared_data=shared_data,
+                )
 
-                    try:
-                        future.result(timeout=VERSION_TIMEOUT)
-                        out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
-                        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                            # Read and encode audio as base64
-                            with open(out_path, "rb") as f:
-                                audio_data = base64.b64encode(f.read()).decode('utf-8')
-                            result = {
-                                "version": version_name,
-                                "status": "done",
-                                "progress": f"{current_progress}/3",
-                                "data": audio_data
-                            }
-                            yield json.dumps(result) + "\n"
-                            logger.info(f"Streamed {version_name} (Progress: {current_progress}/3)")
-                        else:
-                            logger.warning(f"File {version_name} was not created or is empty.")
-                            result = {
-                                "version": version_name,
-                                "status": "failed",
-                                "progress": f"{current_progress}/3",
-                                "error": "Output file not created"
-                            }
-                            yield json.dumps(result) + "\n"
-                    except concurrent.futures.TimeoutError:
-                        logger.error(f"TIMEOUT: {version_name} exceeded {VERSION_TIMEOUT}s – skipping.")
-                        result = {
-                            "version": version_name,
-                            "status": "failed",
-                            "progress": f"{current_progress}/3",
-                            "error": f"Processing timed out after {VERSION_TIMEOUT}s"
-                        }
-                        yield json.dumps(result) + "\n"
-                    except Exception as e:
-                        import traceback
-                        logger.error(f"Error creating {version_name}: {e}\n{traceback.format_exc()}")
-                        result = {
-                            "version": version_name,
-                            "status": "failed",
-                            "progress": f"{current_progress}/3",
-                            "error": str(e)
-                        }
-                        yield json.dumps(result) + "\n"
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    with open(out_path, "rb") as f:
+                        audio_data = base64.b64encode(f.read()).decode('utf-8')
+                    result = {
+                        "version": version_name,
+                        "status": "done",
+                        "progress": "1/1",
+                        "data": audio_data
+                    }
+                    yield json.dumps(result) + "\n"
+                    logger.info("Streamed unified v1 result (Progress: 1/1)")
+                else:
+                    logger.warning("Unified v1 output was not created or is empty.")
+                    result = {
+                        "version": version_name,
+                        "status": "failed",
+                        "progress": "1/1",
+                        "error": "Output file not created"
+                    }
+                    yield json.dumps(result) + "\n"
+            except Exception as e:
+                import traceback
+                logger.error(f"Error creating unified v1 output: {e}\n{traceback.format_exc()}")
+                result = {
+                    "version": version_name,
+                    "status": "failed",
+                    "progress": "1/1",
+                    "error": str(e)
+                }
+                yield json.dumps(result) + "\n"
         
         return StreamingResponse(generate_results(), media_type="application/x-ndjson")
 

@@ -10,6 +10,7 @@ from scipy import signal
 import soundfile as sf
 import logging
 import traceback
+import math
 
 def _check_lfs_pointer(path: str) -> bool:
     """Check if the file is actually a Git LFS text pointer instead of real audio."""
@@ -464,106 +465,306 @@ def time_stretch_heartbeat(input_path, output_path, target_tempo, original_tempo
     if not run_ffmpeg(stretch_cmd):
         run_ffmpeg(f'ffmpeg -y -i "{input_path}" "{output_path}"')
 
-def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, shared_data=None):
-    """Version 1: Pure Natural Mix — Low-pass filter, heartbeat nổi bật nhất.
+def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
+                                     target_duration: float = 10.0,
+                                     min_segment: float = 2.0) -> np.ndarray:
+    """Tìm và ghép đoạn heartbeat ổn định nhất (~10s) từ file gốc.
 
-    - BỎ: Cắt 4 nhịp + aloop vô hạn → gây nhịp tim máy móc, lặp lại
-    - BỎ: atempo trên nhạc nền → nhạc giữ nguyên tempo gốc
-    - THÊM: Dùng toàn bộ heartbeat (≤30s), duration=shortest, fade-out cuối
-    - Nhận shared_data từ preprocess_shared() → bỏ preconvert_asset, loudnorm, convert picked
-    - Dùng fast_mean_volume (numpy) thay vì get_mean_volume (subprocess)
-    - Giảm từ ~12 FFmpeg calls → ~2 calls (silence-remove + final-mix)
+    Thuật toán:
+    1. Chia audio thành các cửa sổ 2s, tính RMS và độ lệch chuẩn năng lượng ngắn hạn.
+    2. Chọn các cửa sổ có RMS cao nhất (nhiều tín hiệu nhất) và độ biến thiên
+       năng lượng thấp nhất (ổn định nhất, ít nhiễu đột biến).
+    3. Ghép nối liên tiếp cho đến khi đủ target_duration.
+       Nếu không đủ đoạn ổn định, bổ sung thêm đoạn tiếp theo tốt nhất.
+
+    Args:
+        y: numpy array audio mono
+        sr: sample rate
+        target_duration: số giây mong muốn (mặc định 10s)
+        min_segment: độ dài cửa sổ tính điểm (giây)
+
+    Returns:
+        numpy array của đoạn heartbeat đã chọn và ghép nối
     """
-    logger.info(f"[v1] Starting mix_audio_v1 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
+    if len(y) == 0:
+        return y
+
+    total_dur = len(y) / sr
+    # Nếu audio quá ngắn, trả về nguyên bản
+    if total_dur <= target_duration:
+        logger.info(f"[stable_seg] Audio ngắn hơn target ({total_dur:.1f}s < {target_duration:.1f}s) → dùng toàn bộ")
+        return y
+
+    win_samples = int(min_segment * sr)
+    hop_samples = win_samples // 2  # 50% overlap
+    n_frames = (len(y) - win_samples) // hop_samples + 1
+
+    if n_frames < 2:
+        logger.info(f"[stable_seg] Không đủ frame để phân tích → dùng toàn bộ")
+        return y
+
+    # Tính điểm cho mỗi cửa sổ
+    scores = []
+    for i in range(n_frames):
+        start = i * hop_samples
+        end = start + win_samples
+        frame = y[start:end]
+        rms = float(np.sqrt(np.mean(frame ** 2)))
+        # Tính variance của short-time energy (độ ổn định)
+        hop_inner = sr // 10  # 100ms hop
+        energies = [
+            np.mean(frame[j:j+hop_inner] ** 2)
+            for j in range(0, len(frame) - hop_inner, hop_inner)
+        ]
+        energy_var = float(np.std(energies)) if len(energies) > 1 else 1.0
+        # Score: RMS cao + variance thấp = ổn định, ít nhiễu
+        # Normalize: dùng log để tránh outlier
+        score = rms / (energy_var + 1e-8)
+        scores.append((score, i))
+
+    # Sắp xếp theo score giảm dần
+    scores.sort(key=lambda x: -x[0])
+
+    # Greedy: chọn các cửa sổ tốt nhất không chồng chéo quá nhiều
+    target_samples = int(target_duration * sr)
+    selected_starts = []
+    selected_total = 0
+    used_ranges = []
+
+    for score, idx in scores:
+        if selected_total >= target_samples:
+            break
+        start = idx * hop_samples
+        end = start + win_samples
+        # Kiểm tra không chồng chéo >50% với cửa sổ đã chọn
+        overlap = False
+        for (s, e) in used_ranges:
+            overlap_len = max(0, min(end, e) - max(start, s))
+            if overlap_len > win_samples * 0.5:
+                overlap = True
+                break
+        if not overlap:
+            selected_starts.append(start)
+            used_ranges.append((start, end))
+            selected_total += win_samples
+
+    if not selected_starts:
+        logger.warning("[stable_seg] Không chọn được đoạn nào → dùng toàn bộ")
+        return y
+
+    # Sắp xếp lại theo thứ tự thời gian để nối mượt
+    selected_starts.sort()
+
+    # Ghép các đoạn đã chọn với crossfade ngắn
+    crossfade_samples = int(0.05 * sr)  # 50ms crossfade
+    segments = []
+    for start in selected_starts:
+        end = min(start + win_samples, len(y))
+        segments.append(y[start:end].copy())
+
+    if len(segments) == 1:
+        result = segments[0]
+    else:
+        # Nối với crossfade
+        result = segments[0]
+        for seg in segments[1:]:
+            if len(result) < crossfade_samples or len(seg) < crossfade_samples:
+                result = np.concatenate([result, seg])
+            else:
+                fade_out = np.linspace(1.0, 0.0, crossfade_samples)
+                fade_in = np.linspace(0.0, 1.0, crossfade_samples)
+                result[-crossfade_samples:] = result[-crossfade_samples:] * fade_out
+                seg_start = seg[:crossfade_samples] * fade_in
+                # Blend overlap region
+                blended = result[-crossfade_samples:] + seg_start
+                result = np.concatenate([result[:-crossfade_samples], blended, seg[crossfade_samples:]])
+
+    actual_dur = len(result) / sr
+    logger.info(f"[stable_seg] Chọn {len(selected_starts)} đoạn, tổng {actual_dur:.1f}s "
+                f"(target {target_duration:.1f}s)")
+    return result
+
+
+def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, heart_tempo=None, music_tempo=None, shared_data=None):
+    """Version duy nhất: HPSS denoising + BPM sync (±15%) + 432Hz + 4s intro heartbeat.
+ 
+    Pipeline:
+    1. Shared preprocessing (preconvert + loudnorm asset, convert picked mono)
+    2. HPSS → tách percussive component (nhịp tim sạch)
+    3. Tìm đoạn heartbeat ổn định nhất ~10s (extract_stable_heartbeat_segment)
+    4. BPM sync: chỉ thay đổi heartbeat tempo tối đa ±15%, nếu delta > 15% giữ nguyên
+    5. 4 giây đầu chỉ có heartbeat (adelay nhạc nền)
+    6. Mix với nhạc nền → loudnorm → 432Hz tuning
+    7. Output FLAC
+    """
+    if heart_tempo is None:
+        _, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
+    if heart_tempo <= 0:
+        heart_tempo = 120.0
+
+    if music_tempo is None:
+        music_tempo = detect_tempo(asset_audio)
+    if music_tempo <= 0:
+        music_tempo = 120.0
+
+    logger.info(f"[mix] Starting mix_audio: heart={heart_tempo:.0f}BPM, music={music_tempo:.0f}BPM")
     temp_dir_obj = tempfile.TemporaryDirectory()
     temp_dir = temp_dir_obj.name
     try:
-        filtered_path = os.path.join(temp_dir, 'picked_filtered.wav')
-        silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
+        denoised_path       = os.path.join(temp_dir, 'picked_denoised.wav')
+        stable_path         = os.path.join(temp_dir, 'picked_stable.wav')
+        stretched_path      = os.path.join(temp_dir, 'picked_stretched.wav')
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
-
-        # === Lấy dữ liệu đã tiền xử lý hoặc fallback ===
+        mixed_temp_path     = os.path.join(temp_dir, 'mixed_temp.flac')
+ 
+        # ── 1. Shared preprocessing ──────────────────────────────────────────
         if shared_data and shared_data.get('success'):
-            temp_wav_path = shared_data['picked_wav_stereo']
+            temp_wav_path = shared_data['picked_wav_mono']
             normalized_asset_path = shared_data['normalized_asset_path']
             vol_asset = shared_data['asset_volume']
-            logger.info(f"[v1] Using shared preprocessed data (0 FFmpeg calls for convert/preconvert)")
+            logger.info(f"[mix] Using shared preprocessed data")
         else:
-            # Fallback: xử lý riêng (backward compatible)
+            logger.info(f"[mix] No shared_data → running local preprocessing")
             temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
             normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
-            run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 2 -ar 44100 "{temp_wav_path}"')
+            run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
             raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
             if not preconvert_asset(asset_audio, raw_asset_path):
-                logger.error(f"[v1] Cannot decode asset audio '{asset_audio}', aborting.")
+                logger.error(f"[mix] Cannot decode asset audio '{asset_audio}', aborting.")
                 return
-            run_ffmpeg(f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
-            vol_asset = get_mean_volume(normalized_asset_path)
-
-        # === HEARTBEAT: Giữ nguyên tự nhiên, chỉ lọc noise ===
-        # [ĐẶC TRƯNG V1] Low-pass filter 1500Hz (Butterworth bậc 5)
-        # Giữ tần số thấp nhịp tim (20-200Hz), loại bỏ noise cao tần
+            run_ffmpeg(
+                f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 '
+                f'-af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"'
+            )
+            vol_asset = fast_mean_volume(normalized_asset_path)
+ 
+        # ── 2. HPSS denoising ────────────────────────────────────────────────
         y, sr = sf.read(temp_wav_path)
-        if y.ndim == 1: y = y[:, np.newaxis]
-        logger.info(f"[v1] Finished reading picked audio: {temp_wav_path}")
-        nyq = 0.5 * sr
-        low = 1500 / nyq  # Tăng lên 1500Hz (trước đây 500Hz) để loa ngoài điện thoại có thể phát được dải mid của nhịp tim
-        b, a = signal.butter(5, low, btype='low')
-        padlen = 3 * (max(len(b), len(a)) - 1)
-        if y.shape[0] > padlen:
-            y_filtered = signal.filtfilt(b, a, y, axis=0)
+        if y.ndim > 1:
+            y = np.mean(y, axis=1)
+        logger.info(f"[mix] Audio loaded: {len(y)/sr:.1f}s @ {sr}Hz")
+ 
+        y_denoised = apply_noise_reduction(y, sr)
+        logger.info(f"[mix] HPSS denoising done")
+ 
+        # ── 3. Chọn đoạn heartbeat ổn định nhất ~10s ────────────────────────
+        y_stable = extract_stable_heartbeat_segment(y_denoised, sr, target_duration=10.0)
+        sf.write(stable_path, y_stable, sr)
+        stable_dur = len(y_stable) / sr
+        logger.info(f"[mix] Stable segment extracted: {stable_dur:.1f}s → {stable_path}")
+ 
+        # ── 4. BPM sync: chỉ thay đổi heartbeat ≤ 15% với fallback xử lý track nhạc
+        heart_tempo = max(40.0, min(180.0, heart_tempo))
+        music_tempo = max(50.0, min(220.0, music_tempo))
+
+        raw_rate = music_tempo / heart_tempo
+        MAX_DELTA = 0.15
+        if abs(raw_rate - 1.0) > MAX_DELTA:
+            tempo_rate = 1.0 + math.copysign(MAX_DELTA, raw_rate - 1.0)
+            logger.info(
+                f"[mix] BPM delta lớn: raw_rate={raw_rate:.3f}, clamp tempo_rate={tempo_rate:.3f} (±15%)"
+            )
         else:
-            y_filtered = y
-        if len(y_filtered.shape) == 2 and y_filtered.shape[1] == 1:
-            y_filtered = y_filtered.squeeze()
-        sf.write(filtered_path, y_filtered, sr)
-        logger.info(f"[v1] Applied low-pass filter: {filtered_path}")
+            tempo_rate = raw_rate
+            logger.info(f"[mix] BPM sync: tempo_rate={tempo_rate:.3f} (within ±15%)")
 
-        # Loại bỏ silence đầu file — FFmpeg call #1
-        run_ffmpeg(f'ffmpeg -y -i "{filtered_path}" -af silenceremove=start_periods=1:start_duration=0:start_threshold=-40dB:detection=peak "{silenced_path}"')
-        logger.info(f"[v1] Removed leading silence: {silenced_path}")
+        asset_atempo = None
+        if abs(raw_rate - 1.0) > 0.45:
+            asset_atempo = 0.95 if raw_rate > 1.0 else 1.05
+            logger.info(f"[mix] Mismatch lớn >45%, sẽ apply asset atempo={asset_atempo:.2f} để gần hơn")
 
-        # Normalize heartbeat — pydub direct WAV load (0 subprocess)
-        picked_seg = AudioSegment.from_file(silenced_path, format='wav').normalize()
-        if picked_seg.dBFS < -50: picked_seg += 10
+        if asset_atempo is not None:
+            stretched_asset_path = os.path.join(temp_dir, 'asset_stretched.wav')
+            if run_ffmpeg(
+                f'ffmpeg -y -i "{normalized_asset_path}" -af "atempo={asset_atempo}" "{stretched_asset_path}"'
+            ):
+                normalized_asset_path = stretched_asset_path
+                logger.info(f"[mix] Asset ngắn tempo xử lý bằng {asset_atempo:.2f}")
+            else:
+                logger.warning(f"[mix] Asset atempo {asset_atempo:.2f} fail -> giữ nguyên asset")
+ 
+        if abs(tempo_rate - 1.0) > 0.005:
+            # FFmpeg call #1 — atempo stretch heartbeat
+            atempo_str = get_atempo_filter(tempo_rate)
+            if not run_ffmpeg(
+                f'ffmpeg -y -i "{stable_path}" -filter:a "{atempo_str}" "{stretched_path}"'
+            ):
+                logger.warning("[mix] atempo stretch failed, using original stable segment")
+                stretched_path = stable_path
+        else:
+            logger.info(f"[mix] rate≈1.0 → skip stretch")
+            stretched_path = stable_path
+ 
+        # ── 5. Normalize heartbeat ───────────────────────────────────────────
+        picked_seg = AudioSegment.from_file(stretched_path, format='wav').normalize()
+        # RMS boost nếu signal sparse (HPSS percussive)
+        target_rms_dbfs = -12.0
+        if picked_seg.dBFS < target_rms_dbfs:
+            boost = min(target_rms_dbfs - picked_seg.dBFS, 18.0)
+            picked_seg = picked_seg + boost
+            logger.info(f"[mix] RMS boost: +{boost:.1f}dB")
         picked_seg.export(normalized_picked_path, format="wav")
         heart_len_s = len(picked_seg) / 1000.0
-        logger.info(f"[v1] Normalized heartbeat: duration={heart_len_s:.1f}s")
-
-        # Đo volume — numpy direct (0 subprocess)
+        logger.info(f"[mix] Normalized heartbeat: {heart_len_s:.1f}s, dBFS={picked_seg.dBFS:.1f}")
+ 
+        # ── 6. Volume balance ─────────────────────────────────────────────────
         vol_picked = fast_mean_volume(normalized_picked_path)
         diff = vol_asset - vol_picked
-        logger.info(f"[v1] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
-
-        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff) - 3)}dB[a0];"
-        # Heartbeat: giữ nguyên tự nhiên, loop theo chiều dài nhạc nền
-        # [FIX] Cấp size chính xác cho aloop để loop đúng duration của file
-        picked_filter = f"[1:a]volume={safe_db(max(0, diff) + 4)}dB,aloop=loop=-1:size={int(heart_len_s * 44100)}[a1];"
-
-        enc = codec_args(output_path)
+        logger.info(f"[mix] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB, diff={diff:.1f}dB")
+ 
+        # ── 7. FFmpeg mix ─────────────────────────────────────────────────────
+        # adelay=4000|4000 → nhạc nền bắt đầu sau 4 giây
+        # Heartbeat: HPSS percussive filter (80-400Hz), loop vô hạn
+        # weights: 0.4 nhạc / 0.6 heartbeat
+        asset_filter = (
+            f"[0:a]"
+            f"adelay=4000|4000,"
+            f"equalizer=f=100:width_type=o:width=2:g=-5,"   # giảm dải mid trùng heartbeat
+            f"volume={safe_db(max(0, -diff) - 3)}dB"
+            f"[a0];"
+        )
+        picked_filter = (
+            f"[1:a]"
+            f"highpass=f=60,lowpass=f=350,"                  # dải tần nhịp tim
+            f"bass=g=4:f=80,"                                 # tăng nhẹ bass 80Hz
+            f"volume={safe_db(max(2, diff + 2) + 6)}dB,"
+            f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
+            f"stereowiden=delay=5,"
+            f"afftdn=nf=-20,"                                 # nhẹ noise floor
+            f"aloop=loop=-1:size={int(heart_len_s * sr)}"
+            f"[a1];"
+        )
         mix_filter = (
             f"{asset_filter}{picked_filter}"
-            
-            # KHÔNG compress mạnh, KHÔNG giảm volume — giữ nguyên cảm giác tự nhiên
-            f"[a1]highpass=f=80,lowpass=f=250,afftdn=nf=-20[a1clean];"
-
-            # Nhạc nền: giảm dải tần 60-200Hz (trùng với heartbeat) để heartbeat nổi lên
-            f"[a0]equalizer=f=100:width_type=o:width=2:g=-4[a0clean];"
-
-            # Mix: heartbeat 55% / nhạc nền 45% → heartbeat nghe rõ nhưng vẫn có nhạc nền
-            f"[a0clean][a1clean]amix=inputs=2:duration=first:dropout_transition=2:weights=0.45 0.55,"
-            f"alimiter=limit=0.9[a]"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
+            f":weights=0.4 0.6,"
+            f"alimiter=limit=0.9"
+            f"[a]"
         )
-        # FFmpeg call #2 — final mix
-        if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{output_path}"'):
-            logger.info(f"[v1] Finished successfully -> {output_path}")
+ 
+        enc = codec_args(mixed_temp_path)
+        # FFmpeg call #2 — mix
+        if not run_ffmpeg(
+            f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" '
+            f'-filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
+        ):
+            logger.error(f"[mix] Final mix FFmpeg call failed")
+            return
+ 
+        # ── 8. 432Hz tuning ──────────────────────────────────────────────────
+        # FFmpeg call #3
+        if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
+            tune_to_432hz(mixed_temp_path, output_path)
+            logger.info(f"[mix] 432Hz tuning done → {output_path}")
         else:
-            logger.error(f"[v1] mix_audio_v1 failed at the final step")
+            logger.error(f"[mix] mixed_temp is empty/missing, skipping 432Hz step")
+ 
     except Exception as e:
-        logger.error(f"[v1] Error during mix_audio_v1: {e}\n{traceback.format_exc()}")
+        logger.error(f"[mix] Error: {e}\n{traceback.format_exc()}")
         raise
     finally:
         temp_dir_obj.cleanup()
+ 
 
 def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, shared_data=None):
     """Version 2: Clean Heartbeat + 432Hz — HPSS separation, ấm áp hơn.

@@ -10,6 +10,7 @@ docker build -t woom-mixer .
 
 ```bash
 docker run -p 8000:8000 woom-mixer
+docker run -d -p 8000:8000 woom-mixer (background)
 ```
 
 ---
