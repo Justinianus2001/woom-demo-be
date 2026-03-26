@@ -100,30 +100,45 @@ def mix_all(
         file_size = os.path.getsize(picked_path)
         logger.info(f"[/mix-all] Finished uploading and saving user file to disk. Size: {file_size} bytes.")
         
-        # Pre-calculate audio features to share across versions (saves roughly 15-20s total)
-        from processor import calculate_duration_from_analysis, detect_tempo
-        logger.info("Analyzing audio tracks...")
-        heart_duration, heart_tempo = calculate_duration_from_analysis(picked_path)
-        music_tempo = detect_tempo(asset_path)
-
-        # === TỐI ƯU: Tiền xử lý chung 1 lần cho cả 3 versions ===
-        # Bỏ preconvert_asset ×3, convert picked ×3, loudnorm ×3, get_mean_volume ×6
-        # → Giảm ~30 FFmpeg subprocess spawns
-        logger.info("Running shared preprocessing (preconvert + loudnorm + WAV convert)...")
-        shared_data = preprocess_shared(asset_path, picked_path, temp_dir)
-        if not shared_data.get('success'):
-            logger.error("Shared preprocessing failed — versions will fallback to individual processing")
-            shared_data = None
-        else:
-            logger.info(f"Shared preprocessing complete. Asset volume: {shared_data['asset_volume']:.1f}dB")
-        
         def generate_results():
-            """Generator that yields a single JSON line for the unified v1 pipeline."""
+            """Generator that yields step-by-step JSON lines for the unified v1 pipeline."""
             version_name = "v1"
             out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
-            logger.info("Submitting unified v1 pipeline...")
+            total_steps = 7
+
+            def emit(step: int, status: str, message: str, data: str = None, error: str = None):
+                payload = {
+                    "version": version_name,
+                    "status": status,
+                    "progress": f"{step}/{total_steps}",
+                    "message": message,
+                }
+                if data is not None:
+                    payload["data"] = data
+                if error is not None:
+                    payload["error"] = error
+                return json.dumps(payload) + "\n"
 
             try:
+                from processor import calculate_duration_from_analysis, detect_tempo
+
+                logger.info("[mix-all] Step 1/7 - analyzing heartbeat tempo")
+                yield emit(1, "progress", "Analyzing heartbeat tempo...")
+                heart_duration, heart_tempo = calculate_duration_from_analysis(picked_path)
+
+                logger.info("[mix-all] Step 2/7 - analyzing track tempo")
+                yield emit(2, "progress", "Analyzing track tempo...")
+                music_tempo = detect_tempo(asset_path)
+
+                logger.info("[mix-all] Step 3/7 - shared preprocessing")
+                yield emit(3, "progress", "Preprocessing shared audio assets...")
+                shared_data = preprocess_shared(asset_path, picked_path, temp_dir)
+                if not shared_data.get('success'):
+                    logger.error("Shared preprocessing failed — using local fallback in mix_audio_v1")
+                    shared_data = None
+
+                logger.info("[mix-all] Step 4/7 - running unified v1 mix")
+                yield emit(4, "progress", "Mixing heartbeat with track...")
                 mix_audio_v1(
                     asset_path,
                     picked_path,
@@ -134,36 +149,23 @@ def mix_all(
                     shared_data=shared_data,
                 )
 
+                logger.info("[mix-all] Step 5/7 - validating output file")
+                yield emit(5, "progress", "Validating mixed output...")
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    logger.info("[mix-all] Step 6/7 - encoding output")
+                    yield emit(6, "progress", "Encoding output audio...")
                     with open(out_path, "rb") as f:
                         audio_data = base64.b64encode(f.read()).decode('utf-8')
-                    result = {
-                        "version": version_name,
-                        "status": "done",
-                        "progress": "1/1",
-                        "data": audio_data
-                    }
-                    yield json.dumps(result) + "\n"
-                    logger.info("Streamed unified v1 result (Progress: 1/1)")
+                    logger.info("[mix-all] Step 7/7 - done")
+                    yield emit(7, "done", "Unified mix ready.", data=audio_data)
+                    logger.info("Streamed unified v1 result (Progress: 7/7)")
                 else:
                     logger.warning("Unified v1 output was not created or is empty.")
-                    result = {
-                        "version": version_name,
-                        "status": "failed",
-                        "progress": "1/1",
-                        "error": "Output file not created"
-                    }
-                    yield json.dumps(result) + "\n"
+                    yield emit(7, "failed", "Mixing failed: output file was not created.", error="Output file not created")
             except Exception as e:
                 import traceback
                 logger.error(f"Error creating unified v1 output: {e}\n{traceback.format_exc()}")
-                result = {
-                    "version": version_name,
-                    "status": "failed",
-                    "progress": "1/1",
-                    "error": str(e)
-                }
-                yield json.dumps(result) + "\n"
+                yield emit(7, "failed", "Mixing failed due to server error.", error=str(e))
         
         return StreamingResponse(generate_results(), media_type="application/x-ndjson")
 
