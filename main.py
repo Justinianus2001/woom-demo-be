@@ -8,6 +8,10 @@ import zipfile
 import logging
 import base64
 import json
+import mimetypes
+import urllib.parse
+import urllib.request
+import urllib.error
 from typing import List
 # v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
 from processor import mix_audio_v1, adjust_bpm, preprocess_shared
@@ -16,11 +20,10 @@ from processor import mix_audio_v1, adjust_bpm, preprocess_shared
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Woom Audio Mixer API")
-
-# Define the tracks directory
-TRACKS_DIR = os.path.join(os.path.dirname(__file__), "tracks")
-os.makedirs(TRACKS_DIR, exist_ok=True)
+R2_PUBLIC_BASE_URL = os.getenv(
+    "R2_PUBLIC_BASE_URL",
+    "https://pub-be426cc47866401c9c6513aa344cb2f0.r2.dev",
+).rstrip("/")
 
 app = FastAPI(title="Woom Audio Mixer API")
 
@@ -41,29 +44,100 @@ def cleanup_temp(temp_dir: str):
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
 
+
+def sanitize_track_name(track_name: str) -> str:
+    """Allow only plain filenames to avoid path traversal from user input."""
+    safe_name = os.path.basename((track_name or "").strip())
+    if not safe_name or safe_name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid track name")
+    if safe_name != track_name.strip():
+        raise HTTPException(status_code=400, detail="Invalid track name")
+    return safe_name
+
+
+def build_r2_track_url(track_name: str) -> str:
+    safe_name = sanitize_track_name(track_name)
+    encoded_name = urllib.parse.quote(safe_name)
+    return f"{R2_PUBLIC_BASE_URL}/{encoded_name}"
+
+
+def download_track_from_r2(track_name: str, temp_dir: str) -> str:
+    """Download selected track from public R2 into temp directory for processing."""
+    safe_name = sanitize_track_name(track_name)
+    track_url = build_r2_track_url(safe_name)
+    local_path = os.path.join(temp_dir, f"r2_{safe_name}")
+
+    logger.info(f"Downloading track from R2: {track_url}")
+    req = urllib.request.Request(track_url, headers={"User-Agent": "woom-mixer/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp, open(local_path, "wb") as out:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            logger.warning(f"Track not found on R2: {safe_name}")
+            raise HTTPException(status_code=404, detail=f"Track '{safe_name}' not found")
+        logger.error(f"R2 HTTP error while downloading '{safe_name}': {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch track from R2")
+    except urllib.error.URLError as e:
+        logger.error(f"R2 URL error while downloading '{safe_name}': {e}")
+        raise HTTPException(status_code=502, detail="Cannot connect to R2")
+
+    if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+        raise HTTPException(status_code=502, detail="Downloaded track is empty")
+
+    logger.info(f"Downloaded R2 track to temp path: {local_path}")
+    return local_path
+
 @app.get("/tracks/{track_name}")
 def get_track(track_name: str):
-    """Serve a specific background music track file."""
+    """Proxy and stream a specific track from Cloudflare R2 by name."""
     try:
-        file_path = os.path.join(TRACKS_DIR, track_name)
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Track not found")
-        return FileResponse(file_path)
+        safe_name = sanitize_track_name(track_name)
+        track_url = build_r2_track_url(safe_name)
+        req = urllib.request.Request(track_url, headers={"User-Agent": "woom-mixer/1.0"})
+
+        try:
+            upstream = urllib.request.urlopen(req, timeout=45)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise HTTPException(status_code=404, detail="Track not found")
+            logger.error(f"R2 HTTP error while proxying '{safe_name}': {e}")
+            raise HTTPException(status_code=502, detail="Failed to fetch track from R2")
+        except urllib.error.URLError as e:
+            logger.error(f"R2 URL error while proxying '{safe_name}': {e}")
+            raise HTTPException(status_code=502, detail="Cannot connect to R2")
+
+        def stream_from_r2():
+            try:
+                with upstream as resp:
+                    while True:
+                        chunk = resp.read(1024 * 256)
+                        if not chunk:
+                            break
+                        yield chunk
+            except Exception as e:
+                logger.error(f"Error while streaming proxied track '{safe_name}': {e}")
+
+        media_type = upstream.headers.get_content_type() or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+        return StreamingResponse(
+            stream_from_r2(),
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error serving track {track_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/tracks")
-def list_tracks():
-    """Return list of available background music tracks."""
-    try:
-        if not os.path.exists(TRACKS_DIR):
-            return {"tracks": []}
-        files = [f for f in os.listdir(TRACKS_DIR) if f.endswith(('.mp3', '.wav', '.m4a'))]
-        return {"tracks": sorted(files)}
-    except Exception as e:
-        logger.error(f"Error listing tracks: {e}")
-        return {"tracks": []}
+# @app.get("/tracks")
+# def list_tracks():
+#     """Deprecated: frontend now uses fixed track names and fetches files via /tracks/{name}."""
+#     return {"tracks": []}
 
 @app.post("/mix-all")
 def mix_all(
@@ -82,11 +156,8 @@ def mix_all(
     background_tasks.add_task(cleanup_temp, temp_dir)
     
     try:
-        # Validate track exists
-        asset_path = os.path.join(TRACKS_DIR, track_name)
-        if not os.path.exists(asset_path):
-            logger.error(f"Track not found: {track_name}")
-            raise HTTPException(status_code=400, detail=f"Track '{track_name}' not found.")
+        # Download selected track from R2 into request temp directory.
+        asset_path = download_track_from_r2(track_name, temp_dir)
         
         logger.info(f"Received mix-all request: picked_file='{picked.filename}', track_name='{track_name}'")
         
@@ -169,6 +240,8 @@ def mix_all(
         
         return StreamingResponse(generate_results(), media_type="application/x-ndjson")
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         logger.error(f"Global error in /mix-all: {e}\n{traceback.format_exc()}")
