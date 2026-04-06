@@ -25,6 +25,73 @@ def _check_lfs_pointer(path: str) -> bool:
 
 logger = logging.getLogger(__name__)
 
+
+def _get_duration_ffprobe(path: str) -> float:
+    """Lấy duration (giây) của file audio bằng ffprobe.
+
+    Hoạt động với mọi format (WAV, FLAC, MP3...).
+    FLAC thường trả về N/A cho format=duration → dùng stream=duration hoặc
+    tính từ nb_samples / sample_rate (đọc từ FLAC STREAMINFO block).
+    """
+
+    def _run(args):
+        r = subprocess.run(
+            args, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+        )
+        return (r.stdout or b'').decode().strip()
+
+    # Strategy 1: format=duration (works for WAV/MP3, sometimes N/A for FLAC)
+    try:
+        val = _run([
+            'ffprobe', '-v', 'quiet',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path,
+        ])
+        if val and val.upper() != 'N/A':
+            return float(val)
+    except Exception:
+        pass
+
+    # Strategy 2: stream=duration — reliable for FLAC (reads STREAMINFO)
+    try:
+        val = _run([
+            'ffprobe', '-v', 'quiet',
+            '-select_streams', 'a:0',
+            '-show_entries', 'stream=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path,
+        ])
+        if val and val.upper() != 'N/A':
+            return float(val)
+    except Exception:
+        pass
+
+    # Strategy 3: compute from nb_samples / sample_rate (FLAC STREAMINFO fallback)
+    try:
+        raw = _run([
+            'ffprobe', '-v', 'quiet',
+            '-select_streams', 'a:0',
+            '-show_entries', 'stream=nb_samples,sample_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path,
+        ])
+        d = {}
+        for line in raw.splitlines():
+            if '=' in line:
+                k, v = line.split('=', 1)
+                d[k.strip()] = v.strip()
+        nb = d.get('nb_samples', 'N/A')
+        sr = d.get('sample_rate', 'N/A')
+        if nb not in ('N/A', '') and sr not in ('N/A', ''):
+            return float(nb) / float(sr)
+    except Exception as e:
+        logger.warning(f"[ffprobe] all duration strategies failed for '{path}': {e}")
+
+    return 0.0
+
+
 def _librosa_load_safe(audio_path: str, duration: float = 30.0):
     """Load audio via librosa, falling back to a temp WAV conversion if the
     file format is not recognised by libsndfile/audioread."""
@@ -586,16 +653,18 @@ def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
 
 
 def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, heart_tempo=None, music_tempo=None, shared_data=None):
-    """Version duy nhất: HPSS denoising + BPM sync (±15%) + 432Hz + 4s intro heartbeat.
- 
+    """Version duy nhất: HPSS denoising + BPM sync (±15%) + 432Hz + 4s intro heartbeat + fade in/out.
+
     Pipeline:
     1. Shared preprocessing (preconvert + loudnorm asset, convert picked mono)
     2. HPSS → tách percussive component (nhịp tim sạch)
     3. Tìm đoạn heartbeat ổn định nhất ~10s (extract_stable_heartbeat_segment)
     4. BPM sync: chỉ thay đổi heartbeat tempo tối đa ±15%, nếu delta > 15% giữ nguyên
     5. 4 giây đầu chỉ có heartbeat (adelay nhạc nền)
-    6. Mix với nhạc nền → loudnorm → 432Hz tuning
-    7. Output FLAC
+    6. Mix với nhạc nền → amix duration=first
+    7b. Fade-in 4s / Fade-out 4s trên finite mixed file (KHÔNG dùng afade trong filter_complex
+        vì aloop=-1 infinite stream → timestamp reset mỗi vòng → afade=t=out không hoạt động)
+    8. 432Hz tuning → Output FLAC
     """
     if heart_tempo is None:
         _, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
@@ -711,26 +780,26 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         vol_picked = fast_mean_volume(normalized_picked_path)
         diff = vol_asset - vol_picked
         logger.info(f"[mix] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB, diff={diff:.1f}dB")
- 
+
         # ── 7. FFmpeg mix ─────────────────────────────────────────────────────
-        # adelay=4000|4000 → nhạc nền bắt đầu sau 4 giây
-        # Heartbeat: HPSS percussive filter (80-400Hz), loop vô hạn
-        # weights: 0.4 nhạc / 0.6 heartbeat
+        # adelay=8000ms → nhạc nền bắt đầu sau 8 giây (= fade_in duration).
+        # Heartbeat loop vô hạn: fade-in/out sẽ được apply ở step 8
+        # SAU khi mix (finite output), tránh bị amix+alimiter nuốt mất fade.
         asset_filter = (
             f"[0:a]"
-            f"adelay=4000|4000,"
-            f"equalizer=f=100:width_type=o:width=2:g=-5,"   # giảm dải mid trùng heartbeat
+            f"adelay=8000|8000,"
+            f"equalizer=f=100:width_type=o:width=2:g=-5,"
             f"volume={safe_db(max(0, -diff) - 3)}dB"
             f"[a0];"
         )
         picked_filter = (
             f"[1:a]"
-            f"highpass=f=60,lowpass=f=350,"                  # dải tần nhịp tim
-            f"bass=g=4:f=80,"                                 # tăng nhẹ bass 80Hz
+            f"highpass=f=60,lowpass=f=350,"
+            f"bass=g=4:f=80,"
             f"volume={safe_db(max(2, diff + 2) + 6)}dB,"
             f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
             f"stereowiden=delay=5,"
-            f"afftdn=nf=-20,"                                 # nhẹ noise floor
+            f"afftdn=nf=-20,"
             f"aloop=loop=-1:size={int(heart_len_s * sr)}"
             f"[a1];"
         )
@@ -741,23 +810,62 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"alimiter=limit=0.9"
             f"[a]"
         )
- 
         enc = codec_args(mixed_temp_path)
-        # FFmpeg call #2 — mix
         if not run_ffmpeg(
             f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" '
             f'-filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
         ):
-            logger.error(f"[mix] Final mix FFmpeg call failed")
+            logger.error("[mix] Final mix FFmpeg call failed")
             return
- 
-        # ── 8. 432Hz tuning ──────────────────────────────────────────────────
-        # FFmpeg call #3
-        if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
-            tune_to_432hz(mixed_temp_path, output_path)
-            logger.info(f"[mix] 432Hz tuning done → {output_path}")
+
+        # ── 8. Fade-in / Fade-out → sau đó 432Hz (2 bước riêng) ───────────────
+        # Dùng sf.info(normalized_asset_path) — ĐÂY LÀ WAV → luôn đọc được.
+        # KHÔNG dùng ffprobe hay sf.info(FLAC) vì cả hai đều fail trên Docker.
+        #
+        # Timing: mixed file duration ≈ asset_dur + 8s (do adelay=8000ms)
+        # → fade_out_start = asset_dur (fade bắt đầu 8s trước khi mix kết thúc)
+        if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
+            logger.error("[mix] mixed_temp is empty/missing, cannot process")
+            return
+
+        try:
+            asset_dur_s = float(sf.info(normalized_asset_path).duration)
+            logger.info(f"[mix] Asset WAV duration: {asset_dur_s:.1f}s")
+        except Exception as e:
+            logger.warning(f"[mix] sf.info WAV failed ({e}), using 180s")
+            asset_dur_s = 180.0
+
+        fade_in_s      = 8.0
+        fade_out_s     = 8.0
+        # mixed duration = asset_dur + 8s → fade_out bắt đầu khi asset vừa hết
+        fade_out_start = asset_dur_s          # = (asset_dur+8) - 8 = asset_dur
+        logger.info(
+            f"[mix] Fade: in 0→{fade_in_s}s | "
+            f"out {fade_out_start:.1f}→{fade_out_start + fade_out_s:.1f}s"
+        )
+
+        # ── 8a. Apply afade trên finite FLAC mixed file ───────────────────────
+        faded_mixed_path = os.path.join(temp_dir, 'mixed_faded.flac')
+        fade_filter = (
+            f"afade=t=in:st=0:d={fade_in_s:.2f},"
+            f"afade=t=out:st={fade_out_start:.2f}:d={fade_out_s:.2f}"
+        )
+        fade_ok = run_ffmpeg(
+            f'ffmpeg -y -i "{mixed_temp_path}" '
+            f'-af "{fade_filter}" '
+            f'-c:a flac -compression_level 5 "{faded_mixed_path}"'
+        )
+        if fade_ok and os.path.exists(faded_mixed_path) and os.path.getsize(faded_mixed_path) > 0:
+            logger.info("[mix] ✅ Fade-in/out applied successfully")
+            src_for_432 = faded_mixed_path
         else:
-            logger.error(f"[mix] mixed_temp is empty/missing, skipping 432Hz step")
+            logger.warning("[mix] ⚠️ Fade step failed — applying 432Hz without fade")
+            src_for_432 = mixed_temp_path
+
+        # ── 8b. 432Hz tuning ──────────────────────────────────────────────────
+        tune_to_432hz(src_for_432, output_path)
+        logger.info(f"[mix] ✅ 432Hz tuning done → {output_path}")
+
  
     except Exception as e:
         logger.error(f"[mix] Error: {e}\n{traceback.format_exc()}")
