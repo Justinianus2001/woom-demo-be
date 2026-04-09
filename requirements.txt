@@ -6,3 +6,4 @@ pydub
 numpy
 scipy
 soundfile
+boto3
