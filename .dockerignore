@@ -1,11 +1,12 @@
 __pycache__/
+.git
+.git/**
 *.pyc
 *.pyo
 *.pyd
 .Python
 env/
 venv/
-.env
 .venv
 pip-log.txt
 pip-delete-this-directory.txt
