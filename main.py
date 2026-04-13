@@ -91,6 +91,17 @@ R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_S3_ENDPOINT = os.getenv("R2_S3_ENDPOINT", "").strip()
 ALLOWED_TRACK_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac"}
+MIX_OUTPUT_FORMATS = {
+    "flac": "audio/flac",
+    "mp3": "audio/mpeg",
+}
+
+
+def resolve_mix_output_format(raw_value: str) -> str:
+    normalized = str(raw_value or "flac").strip().lower()
+    if normalized in MIX_OUTPUT_FORMATS:
+        return normalized
+    return "flac"
 
 app = FastAPI(title="Woom Audio Mixer API")
 
@@ -319,10 +330,19 @@ def stream_track_from_r2(track_name: str, as_attachment: bool = False):
     return StreamingResponse(stream_from_r2(), media_type=media_type, headers=headers)
 
 
-def generate_mix_results(asset_path: str, picked_path: str, temp_dir: str, endpoint_name: str):
+def generate_mix_results(
+    asset_path: str,
+    picked_path: str,
+    temp_dir: str,
+    endpoint_name: str,
+    output_format: str,
+    debug_status_only: bool,
+):
     """Generator for unified v1 mix pipeline (shared by /mix-all and /mix-file)."""
     version_name = "v1"
-    out_path = os.path.join(temp_dir, f"{version_name}_mixed.flac")
+    resolved_format = resolve_mix_output_format(output_format)
+    output_mime_type = MIX_OUTPUT_FORMATS[resolved_format]
+    out_path = os.path.join(temp_dir, f"{version_name}_mixed.{resolved_format}")
     total_steps = 7
 
     def emit(step: int, status: str, message: str, data: str = None, error: str = None):
@@ -371,12 +391,38 @@ def generate_mix_results(asset_path: str, picked_path: str, temp_dir: str, endpo
         logger.info(f"[{endpoint_name}] Step 5/7 - validating output")
         yield emit(5, "progress", "Validating mixed output...")
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if debug_status_only:
+                logger.info(f"[{endpoint_name}] Step 6/7 - preparing status-only response")
+                yield emit(6, "progress", "Preparing status-only response...")
+                logger.info(f"[{endpoint_name}] Step 7/7 - done (status-only)")
+                payload = {
+                    "version": version_name,
+                    "status": "done",
+                    "progress": f"{total_steps}/{total_steps}",
+                    "message": "Unified mix ready (status-only).",
+                    "audio_format": resolved_format,
+                    "mime_type": output_mime_type,
+                    "status_only": True,
+                    "output_bytes": os.path.getsize(out_path),
+                }
+                yield json.dumps(payload) + "\n"
+                return
+
             logger.info(f"[{endpoint_name}] Step 6/7 - encoding output")
             yield emit(6, "progress", "Encoding output audio...")
             with open(out_path, "rb") as f:
                 audio_data = base64.b64encode(f.read()).decode("utf-8")
             logger.info(f"[{endpoint_name}] Step 7/7 - done")
-            yield emit(7, "done", "Unified mix ready.", data=audio_data)
+            payload = {
+                "version": version_name,
+                "status": "done",
+                "progress": f"{total_steps}/{total_steps}",
+                "message": "Unified mix ready.",
+                "data": audio_data,
+                "audio_format": resolved_format,
+                "mime_type": output_mime_type,
+            }
+            yield json.dumps(payload) + "\n"
             return
 
         logger.warning(f"[{endpoint_name}] Unified v1 output missing or empty")
@@ -437,7 +483,9 @@ def get_track_audio(track_name: str):
 def mix_all(
     background_tasks: BackgroundTasks,
     picked: UploadFile = File(...),
-    track_name: str = Form(...)
+    track_name: str = Form(...),
+    output_format: str = Form("flac"),
+    debug_status_only: bool = Form(False),
 ):
     """
     Mix heartbeat (picked) with a pre-selected background music track.
@@ -468,8 +516,19 @@ def mix_all(
         file_size = os.path.getsize(picked_path)
         logger.info(f"[/mix-all] Finished uploading and saving user file to disk. Size: {file_size} bytes.")
 
+        mix_format = resolve_mix_output_format(output_format)
+        logger.info(f"[/mix-all] Requested output format: {mix_format}")
+        logger.info(f"[/mix-all] debug_status_only={debug_status_only}")
+
         return StreamingResponse(
-            generate_mix_results(asset_path, picked_path, temp_dir, endpoint_name="mix-all"),
+            generate_mix_results(
+                asset_path,
+                picked_path,
+                temp_dir,
+                endpoint_name="mix-all",
+                output_format=mix_format,
+                debug_status_only=debug_status_only,
+            ),
             media_type="application/x-ndjson",
         )
 
@@ -486,6 +545,8 @@ def mix_file(
     background_tasks: BackgroundTasks,
     track_name: str = Form(...),
     heartbeat_name: str = Form(...),
+    output_format: str = Form("flac"),
+    debug_status_only: bool = Form(False),
 ):
     """Mix two existing files from R2: one trackbeat and one heartbeat from library."""
     logger.info(
@@ -505,8 +566,19 @@ def mix_file(
             os.path.getsize(heartbeat_path),
         )
 
+        mix_format = resolve_mix_output_format(output_format)
+        logger.info(f"[/mix-file] Requested output format: {mix_format}")
+        logger.info(f"[/mix-file] debug_status_only={debug_status_only}")
+
         return StreamingResponse(
-            generate_mix_results(asset_path, heartbeat_path, temp_dir, endpoint_name="mix-file"),
+            generate_mix_results(
+                asset_path,
+                heartbeat_path,
+                temp_dir,
+                endpoint_name="mix-file",
+                output_format=mix_format,
+                debug_status_only=debug_status_only,
+            ),
             media_type="application/x-ndjson",
         )
     except HTTPException:
@@ -536,8 +608,13 @@ def adjust_bpm_endpoint(
 
     logger.info(f"[/adjust-bpm] Starting to write user input file to local temp disk...")
 
-    # save incoming file
-    input_path = os.path.join(temp_dir, "input_mix.mp3")
+    # Save incoming file with best-effort real extension to avoid demux ambiguity.
+    incoming_name = os.path.basename(file.filename or "")
+    incoming_ext = os.path.splitext(incoming_name)[1].lower()
+    if incoming_ext not in ALLOWED_TRACK_EXTENSIONS:
+        guessed_ext = (mimetypes.guess_extension(file.content_type or "") or "").lower()
+        incoming_ext = guessed_ext if guessed_ext in ALLOWED_TRACK_EXTENSIONS else ".flac"
+    input_path = os.path.join(temp_dir, f"input_mix{incoming_ext}")
     with open(input_path, "wb") as buf:
         shutil.copyfileobj(file.file, buf)
 
