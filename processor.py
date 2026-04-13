@@ -186,6 +186,12 @@ def detect_tempo(audio_path):
         return 120.0
 
 FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
+INTRO_DELAY_MS = 4000
+INTRO_SECONDS = INTRO_DELAY_MS / 1000.0
+MIN_REASONABLE_MIX_SECONDS = 8.0
+MIN_DURATION_RATIO_VS_ASSET = 0.55
+SILENT_DBFS_THRESHOLD = -70.0
+MIN_PRECONVERT_ASSET_SECONDS = 8.0
 
 
 def preconvert_asset(asset_audio: str, output_path: str) -> bool:
@@ -207,7 +213,7 @@ def preconvert_asset(asset_audio: str, output_path: str) -> bool:
     they return rc=0 but produce silent/garbage audio because they misinterpret
     the headers as raw sample data.
 
-    Returns True if any strategy succeeded AND the output has non-silent audio.
+    Returns True if any strategy succeeded and passed basic sanity checks.
     """
     if _check_lfs_pointer(asset_audio):
         logger.error(f"❌ '{asset_audio}' is a Git LFS pointer, not actual audio data! Run 'git lfs pull' on your server.")
@@ -215,41 +221,95 @@ def preconvert_asset(asset_audio: str, output_path: str) -> bool:
     strategies = [
         # (label, extra input flags before -i)
         ("auto_large_probe", "-probesize 50M -analyzeduration 100M"),
-        ("mp3",   "-f mp3"),
-        ("mp4",   "-f mp4"),
-        ("flac",  "-f flac"),
-        ("w64",   "-f w64"),
         ("auto",  ""),
         ("wav",   "-f wav"),
+        ("w64",   "-f w64"),
+        ("flac",  "-f flac"),
+        ("mp4",   "-f mp4"),
+        ("mp3",   "-f mp3"),
     ]
+
+    best_candidate = None
+    best_score = -1.0
+
     for label, extra in strategies:
-        cmd = f'ffmpeg -y {extra} -i "{asset_audio}" -ar 44100 -ac 2 -sample_fmt s16 "{output_path}"'.strip()
+        candidate_path = f"{output_path}.{label}.wav"
+        cmd = f'ffmpeg -y {extra} -i "{asset_audio}" -ar 44100 -ac 2 -sample_fmt s16 "{candidate_path}"'.strip()
         # Collapse double spaces that appear when extra == ""
         cmd = ' '.join(cmd.split())
         if run_ffmpeg(cmd):
-            if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+            if not (os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 0):
                 logger.warning(f"[preconvert_asset] Strategy '{label}' produced empty file, skipping.")
-                _try_unlink(output_path)
+                _try_unlink(candidate_path)
                 continue
             # Validate: make sure the audio actually has signal (not all-zero silence)
             try:
-                data, _ = sf.read(output_path, frames=8192)
+                info = sf.info(candidate_path)
+                decoded_duration = float(getattr(info, 'duration', 0.0) or 0.0)
+
+                # Duration is the most reliable signal here. Some tracks start with
+                # silence, so sampling only the first 8192 frames can be misleading.
+                if decoded_duration >= MIN_PRECONVERT_ASSET_SECONDS:
+                    if best_candidate and best_candidate != candidate_path:
+                        _try_unlink(best_candidate)
+                    os.replace(candidate_path, output_path)
+                    logger.info(
+                        f"[preconvert_asset] Success with strategy '{label}' "
+                        f"(duration={decoded_duration:.1f}s)"
+                    )
+                    return True
+
+                data, _ = sf.read(candidate_path, frames=8192)
                 rms = float(np.sqrt(np.mean(data ** 2))) if len(data) > 0 else 0.0
                 if rms < 1e-6:
                     logger.warning(
                         f"[preconvert_asset] Strategy '{label}' produced silent audio "
                         f"(RMS={rms:.2e}), likely wrong format — skipping."
                     )
-                    _try_unlink(output_path)
+                    _try_unlink(candidate_path)
                     continue
+
+                score = decoded_duration * max(rms, 1e-6)
+                if score > best_score:
+                    if best_candidate:
+                        _try_unlink(best_candidate)
+                    best_candidate = candidate_path
+                    best_score = score
+                else:
+                    _try_unlink(candidate_path)
+
+                logger.warning(
+                    f"[preconvert_asset] Strategy '{label}' decoded too short "
+                    f"({decoded_duration:.2f}s) — trying next strategy."
+                )
             except Exception as val_err:
                 logger.warning(f"[preconvert_asset] Validation failed for strategy '{label}': {val_err}")
-                _try_unlink(output_path)
+                _try_unlink(candidate_path)
                 continue
-            logger.info(f"[preconvert_asset] Success with strategy '{label}' (RMS={rms:.4f})")
-            return True
         else:
-            _try_unlink(output_path)
+            _try_unlink(candidate_path)
+
+    if best_candidate and os.path.exists(best_candidate):
+        try:
+            info = sf.info(best_candidate)
+            decoded_duration = float(getattr(info, 'duration', 0.0) or 0.0)
+            if decoded_duration >= MIN_PRECONVERT_ASSET_SECONDS:
+                os.replace(best_candidate, output_path)
+                logger.warning(
+                    f"[preconvert_asset] Using best candidate after all strategies "
+                    f"(duration={decoded_duration:.2f}s)."
+                )
+                return True
+            logger.error(
+                f"[preconvert_asset] Best decoded candidate still too short "
+                f"({decoded_duration:.2f}s < {MIN_PRECONVERT_ASSET_SECONDS:.2f}s)."
+            )
+            _try_unlink(best_candidate)
+            return False
+        except Exception as e:
+            logger.error(f"[preconvert_asset] Cannot finalize best candidate: {e}")
+            _try_unlink(best_candidate)
+
     logger.error(f"[preconvert_asset] All strategies failed for '{asset_audio}'")
     return False
 
@@ -325,6 +385,61 @@ def fast_mean_volume(wav_path: str) -> float:
     except Exception as e:
         logger.error(f"❌ fast_mean_volume thất bại: {e}\n{traceback.format_exc()}")
         return -16.0
+
+
+def quick_mean_volume(audio_path: str, max_seconds: float = 8.0) -> float:
+    """Estimate dBFS from a short sample window to reduce CPU and I/O."""
+    try:
+        with sf.SoundFile(audio_path) as audio_file:
+            total_frames = len(audio_file)
+            if total_frames <= 0:
+                return -96.0
+
+            sample_frames = int(max(1, max_seconds * max(1, audio_file.samplerate)))
+            sample_frames = min(sample_frames, total_frames)
+            data = audio_file.read(sample_frames, dtype='float32')
+            if len(data) == 0:
+                return -96.0
+
+            rms = float(np.sqrt(np.mean(data ** 2)))
+            if rms <= 0:
+                return -96.0
+            return 20.0 * math.log10(rms)
+    except Exception as e:
+        logger.warning(f"[quick_mean_volume] fallback to full read for '{audio_path}': {e}")
+        return fast_mean_volume(audio_path)
+
+
+def evaluate_mixed_output(mix_path: str, expected_asset_duration: float = 0.0):
+    """Validate mixed audio duration and loudness to catch silent/short regressions.
+
+    Returns:
+        tuple(bool, str, float, float):
+            (is_healthy, reason, measured_duration_s, measured_dbfs)
+    """
+    if not os.path.exists(mix_path) or os.path.getsize(mix_path) == 0:
+        return False, "missing-or-empty", 0.0, -120.0
+
+    measured_duration = 0.0
+    try:
+        measured_duration = float(sf.info(mix_path).duration)
+    except Exception as info_err:
+        logger.warning(f"[mix] Cannot read mix duration via soundfile: {info_err}")
+
+    measured_dbfs = quick_mean_volume(mix_path)
+
+    if measured_duration > 0 and expected_asset_duration and expected_asset_duration > 0:
+        min_expected = max(
+            MIN_REASONABLE_MIX_SECONDS,
+            expected_asset_duration * MIN_DURATION_RATIO_VS_ASSET,
+        )
+        if measured_duration < min_expected:
+            return False, f"too-short:{measured_duration:.2f}s<{min_expected:.2f}s", measured_duration, measured_dbfs
+
+    if measured_dbfs <= SILENT_DBFS_THRESHOLD:
+        return False, f"too-silent:{measured_dbfs:.2f}dBFS", measured_duration, measured_dbfs
+
+    return True, "ok", measured_duration, measured_dbfs
 
 
 def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
@@ -501,8 +616,12 @@ def tune_to_432hz(input_path, output_path):
     """Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz dùng FFmpeg."""
     # asetrate changes pitch and speed, atempo corrects the speed back.
     # 432/440 = 0.981818... and 440/432 = 1.018518...
-    cmd = f'ffmpeg -y -i "{input_path}" -af "asetrate=44100*432/440,aresample=44100,atempo=1.0185185185185186" "{output_path}"'
-    run_ffmpeg(cmd)
+    cmd = (
+        f'ffmpeg -y -i "{input_path}" '
+        f'-af "asetrate=44100*432/440,aresample=44100,atempo=1.0185185185185186" '
+        f'{codec_args(output_path)} "{output_path}"'
+    )
+    return run_ffmpeg(cmd)
 
 def get_atempo_filter(rate):
     """Helper to generate atempo filter string, chaining if rate is outside [0.5, 100]."""
@@ -782,12 +901,19 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         logger.info(f"[mix] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB, diff={diff:.1f}dB")
 
         # ── 7. FFmpeg mix ─────────────────────────────────────────────────────
-        # adelay=8000ms → nhạc nền bắt đầu sau 8 giây (= fade_in duration).
+        # adelay=4000ms → nhạc nền bắt đầu sau 4 giây.
         # Heartbeat loop vô hạn: fade-in/out sẽ được apply ở step 8
         # SAU khi mix (finite output), tránh bị amix+alimiter nuốt mất fade.
+        try:
+            asset_dur_s = float(sf.info(normalized_asset_path).duration)
+            logger.info(f"[mix] Asset WAV duration: {asset_dur_s:.1f}s")
+        except Exception as e:
+            logger.warning(f"[mix] sf.info WAV failed ({e}), skip duration threshold check")
+            asset_dur_s = 0.0
+
         asset_filter = (
             f"[0:a]"
-            f"adelay=8000|8000,"
+            f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
             f"equalizer=f=100:width_type=o:width=2:g=-5,"
             f"volume={safe_db(max(0, -diff) - 3)}dB"
             f"[a0];"
@@ -818,27 +944,77 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             logger.error("[mix] Final mix FFmpeg call failed")
             return
 
+        is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
+            mixed_temp_path,
+            expected_asset_duration=asset_dur_s,
+        )
+        logger.info(
+            f"[mix] Mixed health check: ok={is_healthy}, reason={health_reason}, "
+            f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
+        )
+
+        if not is_healthy:
+            fallback_mixed_path = os.path.join(temp_dir, 'mixed_temp_fallback.flac')
+            logger.warning(f"[mix] Primary mix unhealthy ({health_reason}), running safe fallback chain")
+            fallback_filter = (
+                f"[0:a]"
+                f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
+                f"equalizer=f=100:width_type=o:width=2:g=-3,"
+                f"volume={safe_db(max(0, -diff) - 2)}dB"
+                f"[a0];"
+                f"[1:a]"
+                f"highpass=f=55,lowpass=f=360,"
+                f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
+                f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
+                f"[a1];"
+                f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1,"
+                f"alimiter=limit=0.92"
+                f"[a]"
+            )
+            fallback_ok = run_ffmpeg(
+                f'ffmpeg -y -i "{normalized_asset_path}" -stream_loop -1 -i "{normalized_picked_path}" '
+                f'-filter_complex "{fallback_filter}" -map "[a]" '
+                f'-c:a flac -compression_level 5 "{fallback_mixed_path}"'
+            )
+            if not fallback_ok:
+                logger.error("[mix] Safe fallback chain failed")
+                return
+
+            fb_ok, fb_reason, fb_dur, fb_db = evaluate_mixed_output(
+                fallback_mixed_path,
+                expected_asset_duration=asset_dur_s,
+            )
+            logger.info(
+                f"[mix] Fallback health check: ok={fb_ok}, reason={fb_reason}, "
+                f"duration={fb_dur:.1f}s, dbfs={fb_db:.1f}"
+            )
+            if not fb_ok:
+                logger.error(f"[mix] Fallback output still unhealthy: {fb_reason}")
+                return
+            mixed_temp_path = fallback_mixed_path
+
         # ── 8. Fade-in / Fade-out → sau đó 432Hz (2 bước riêng) ───────────────
         # Dùng sf.info(normalized_asset_path) — ĐÂY LÀ WAV → luôn đọc được.
         # KHÔNG dùng ffprobe hay sf.info(FLAC) vì cả hai đều fail trên Docker.
         #
-        # Timing: mixed file duration ≈ asset_dur + 8s (do adelay=8000ms)
-        # → fade_out_start = asset_dur (fade bắt đầu 8s trước khi mix kết thúc)
+        # Timing: mixed file duration ≈ asset_dur + 4s (do adelay=4000ms)
+        # → fade_out_start = mixed_dur - fade_out_duration
         if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
             logger.error("[mix] mixed_temp is empty/missing, cannot process")
             return
 
         try:
-            asset_dur_s = float(sf.info(normalized_asset_path).duration)
-            logger.info(f"[mix] Asset WAV duration: {asset_dur_s:.1f}s")
-        except Exception as e:
-            logger.warning(f"[mix] sf.info WAV failed ({e}), using 180s")
-            asset_dur_s = 180.0
+            mixed_dur_s = float(sf.info(mixed_temp_path).duration)
+        except Exception as mixed_info_err:
+            logger.warning(f"[mix] Cannot read mixed duration via soundfile: {mixed_info_err}")
+            mixed_dur_s = 0.0
 
-        fade_in_s      = 8.0
-        fade_out_s     = 8.0
-        # mixed duration = asset_dur + 8s → fade_out bắt đầu khi asset vừa hết
-        fade_out_start = asset_dur_s          # = (asset_dur+8) - 8 = asset_dur
+        if mixed_dur_s <= 0:
+            mixed_dur_s = (asset_dur_s + INTRO_SECONDS) if asset_dur_s > 0 else (INTRO_SECONDS + 12.0)
+
+        fade_in_s      = INTRO_SECONDS
+        fade_out_s     = INTRO_SECONDS
+        fade_out_start = max(0.0, mixed_dur_s - fade_out_s)
         logger.info(
             f"[mix] Fade: in 0→{fade_in_s}s | "
             f"out {fade_out_start:.1f}→{fade_out_start + fade_out_s:.1f}s"
@@ -863,7 +1039,13 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             src_for_432 = mixed_temp_path
 
         # ── 8b. 432Hz tuning ──────────────────────────────────────────────────
-        tune_to_432hz(src_for_432, output_path)
+        if not tune_to_432hz(src_for_432, output_path):
+            logger.warning("[mix] 432Hz tuning failed, exporting original mixed source")
+            if not run_ffmpeg(
+                f'ffmpeg -y -i "{src_for_432}" {codec_args(output_path)} "{output_path}"'
+            ):
+                logger.error("[mix] Final export failed after 432Hz fallback")
+                return
         logger.info(f"[mix] ✅ 432Hz tuning done → {output_path}")
 
  
