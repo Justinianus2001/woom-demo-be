@@ -186,8 +186,12 @@ def detect_tempo(audio_path):
         return 120.0
 
 FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
-INTRO_DELAY_MS = 4000
+INTRO_DELAY_MS = 5000
 INTRO_SECONDS = INTRO_DELAY_MS / 1000.0
+FADE_IN_SECONDS = 0.0
+FADE_OUT_SECONDS = 8.0
+HEARTBEAT_SILENT_LEAD_SECONDS = 0.5
+HEARTBEAT_VOLUME_RAMP_SECONDS = 1.5
 MIN_REASONABLE_MIX_SECONDS = 8.0
 MIN_DURATION_RATIO_VS_ASSET = 0.55
 SILENT_DBFS_THRESHOLD = -70.0
@@ -918,10 +922,17 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"volume={safe_db(max(0, -diff) - 3)}dB"
             f"[a0];"
         )
+        heartbeat_ramp_end_s = HEARTBEAT_SILENT_LEAD_SECONDS + HEARTBEAT_VOLUME_RAMP_SECONDS
+        heartbeat_intro_envelope = (
+            f"if(lt(t,{HEARTBEAT_SILENT_LEAD_SECONDS:.2f}),0,"
+            f"if(lt(t,{heartbeat_ramp_end_s:.2f}),"
+            f"(t-{HEARTBEAT_SILENT_LEAD_SECONDS:.2f})/{HEARTBEAT_VOLUME_RAMP_SECONDS:.2f},1))"
+        )
         picked_filter = (
             f"[1:a]"
             f"highpass=f=60,lowpass=f=350,"
             f"bass=g=4:f=80,"
+            f"volume='{heartbeat_intro_envelope}':eval=frame,"
             f"volume={safe_db(max(2, diff + 2) + 6)}dB,"
             f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
             f"stereowiden=delay=5,"
@@ -964,6 +975,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                 f"[a0];"
                 f"[1:a]"
                 f"highpass=f=55,lowpass=f=360,"
+                f"volume='{heartbeat_intro_envelope}':eval=frame,"
                 f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
                 f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
                 f"[a1];"
@@ -1012,8 +1024,8 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         if mixed_dur_s <= 0:
             mixed_dur_s = (asset_dur_s + INTRO_SECONDS) if asset_dur_s > 0 else (INTRO_SECONDS + 12.0)
 
-        fade_in_s      = INTRO_SECONDS
-        fade_out_s     = INTRO_SECONDS
+        fade_in_s      = FADE_IN_SECONDS
+        fade_out_s     = FADE_OUT_SECONDS
         fade_out_start = max(0.0, mixed_dur_s - fade_out_s)
         logger.info(
             f"[mix] Fade: in 0→{fade_in_s}s | "
@@ -1022,15 +1034,24 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
 
         # ── 8a. Apply afade trên finite FLAC mixed file ───────────────────────
         faded_mixed_path = os.path.join(temp_dir, 'mixed_faded.flac')
-        fade_filter = (
-            f"afade=t=in:st=0:d={fade_in_s:.2f},"
-            f"afade=t=out:st={fade_out_start:.2f}:d={fade_out_s:.2f}"
-        )
-        fade_ok = run_ffmpeg(
-            f'ffmpeg -y -i "{mixed_temp_path}" '
-            f'-af "{fade_filter}" '
-            f'-c:a flac -compression_level 5 "{faded_mixed_path}"'
-        )
+        fade_parts = []
+        if fade_in_s > 0.01:
+            fade_parts.append(f"afade=t=in:st=0:d={fade_in_s:.2f}")
+        if fade_out_s > 0.01:
+            fade_parts.append(f"afade=t=out:st={fade_out_start:.2f}:d={fade_out_s:.2f}")
+
+        fade_ok = True
+        if fade_parts:
+            fade_filter = ",".join(fade_parts)
+            fade_ok = run_ffmpeg(
+                f'ffmpeg -y -i "{mixed_temp_path}" '
+                f'-af "{fade_filter}" '
+                f'-c:a flac -compression_level 5 "{faded_mixed_path}"'
+            )
+        else:
+            fade_ok = run_ffmpeg(
+                f'ffmpeg -y -i "{mixed_temp_path}" -c:a flac -compression_level 5 "{faded_mixed_path}"'
+            )
         if fade_ok and os.path.exists(faded_mixed_path) and os.path.getsize(faded_mixed_path) > 0:
             logger.info("[mix] ✅ Fade-in/out applied successfully")
             src_for_432 = faded_mixed_path
