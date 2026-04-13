@@ -192,10 +192,21 @@ FADE_IN_SECONDS = 0.0
 FADE_OUT_SECONDS = 8.0
 HEARTBEAT_SILENT_LEAD_SECONDS = 0.5
 HEARTBEAT_VOLUME_RAMP_SECONDS = 1.5
+HEARTBEAT_MIN_VALID_SECONDS = 0.1
 MIN_REASONABLE_MIX_SECONDS = 8.0
 MIN_DURATION_RATIO_VS_ASSET = 0.55
 SILENT_DBFS_THRESHOLD = -70.0
 MIN_PRECONVERT_ASSET_SECONDS = 8.0
+
+HEARTBEAT_INPUT_STRATEGIES = [
+    ("auto_large_probe", "-probesize 50M -analyzeduration 100M"),
+    ("auto", ""),
+    ("wav", "-f wav"),
+    ("w64", "-f w64"),
+    ("flac", "-f flac"),
+    ("mp4", "-f mp4"),
+    ("mp3", "-f mp3"),
+]
 
 
 def preconvert_asset(asset_audio: str, output_path: str) -> bool:
@@ -325,6 +336,66 @@ def _try_unlink(path: str) -> None:
             os.unlink(path)
         except OSError:
             pass
+
+
+def _is_valid_decoded_audio(path: str, min_duration: float = HEARTBEAT_MIN_VALID_SECONDS) -> bool:
+    """Return True if decoded audio exists, is non-empty, and libsndfile can read it."""
+    if not (path and os.path.exists(path) and os.path.getsize(path) > 0):
+        return False
+    try:
+        duration = float(getattr(sf.info(path), 'duration', 0.0) or 0.0)
+    except Exception:
+        return False
+    return duration >= min_duration
+
+
+def _ffmpeg_convert_heartbeat_variants(picked_audio: str, stereo_out: str, mono_out: str) -> bool:
+    """Convert uploaded heartbeat to PCM WAV stereo+mono with robust demuxer fallbacks."""
+    if _check_lfs_pointer(picked_audio):
+        logger.error(
+            f"❌ '{picked_audio}' is a Git LFS pointer, not actual audio data! Run 'git lfs pull' on your server."
+        )
+        return False
+
+    _try_unlink(stereo_out)
+    _try_unlink(mono_out)
+
+    # Fast path: single ffmpeg process writes both outputs.
+    if run_ffmpeg(
+        f'ffmpeg -y -i "{picked_audio}" '
+        f'-t 30 -ar 44100 -ac 2 -sample_fmt s16 "{stereo_out}" '
+        f'-t 30 -ar 44100 -ac 1 -sample_fmt s16 "{mono_out}"'
+    ):
+        if _is_valid_decoded_audio(stereo_out) and _is_valid_decoded_audio(mono_out):
+            return True
+        logger.warning("[heartbeat_convert] Fast-path decode produced invalid outputs, trying fallbacks")
+
+    _try_unlink(stereo_out)
+    _try_unlink(mono_out)
+
+    for label, extra in HEARTBEAT_INPUT_STRATEGIES:
+        stereo_cmd = (
+            f'ffmpeg -y {extra} -i "{picked_audio}" '
+            f'-t 30 -ar 44100 -ac 2 -sample_fmt s16 "{stereo_out}"'
+        )
+        mono_cmd = (
+            f'ffmpeg -y {extra} -i "{picked_audio}" '
+            f'-t 30 -ar 44100 -ac 1 -sample_fmt s16 "{mono_out}"'
+        )
+        stereo_cmd = ' '.join(stereo_cmd.split())
+        mono_cmd = ' '.join(mono_cmd.split())
+
+        stereo_ok = run_ffmpeg(stereo_cmd)
+        mono_ok = run_ffmpeg(mono_cmd)
+        if stereo_ok and mono_ok and _is_valid_decoded_audio(stereo_out) and _is_valid_decoded_audio(mono_out):
+            logger.info(f"[heartbeat_convert] Success with strategy '{label}'")
+            return True
+
+        _try_unlink(stereo_out)
+        _try_unlink(mono_out)
+
+    logger.error(f"[heartbeat_convert] All decode strategies failed for '{picked_audio}'")
+    return False
 
 
 def safe_db(value: float, fallback: float = 0.0, limit: float = 40.0) -> float:
@@ -462,6 +533,7 @@ def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
         - 'picked_wav_stereo': str – heartbeat WAV 44100Hz stereo (cho v1)
         - 'picked_wav_mono': str – heartbeat WAV 44100Hz mono (cho v2/v3/v4)
         - 'asset_volume': float – mean volume dBFS
+        - 'error': str | None – machine-readable preprocessing error code
         - 'success': bool
 
     Raises RuntimeError if asset cannot be decoded.
@@ -476,7 +548,7 @@ def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
     # 1) Pre-convert asset (worst case tries 7 strategies — but only ONCE)
     if not preconvert_asset(asset_audio, raw_asset_path):
         logger.error(f"[preprocess_shared] Cannot decode asset audio '{asset_audio}'")
-        return {'success': False}
+        return {'success': False, 'error': 'asset-decode-failed'}
 
     # 2) Loudnorm asset → chuẩn -16 LUFS
     if not run_ffmpeg(
@@ -484,18 +556,13 @@ def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
         f'-af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"'
     ):
         logger.error("[preprocess_shared] Asset loudnorm failed")
-        return {'success': False}
+        return {'success': False, 'error': 'asset-loudnorm-failed'}
     _try_unlink(raw_asset_path)  # free disk space early
 
-    # 3) Convert picked → WAV stereo (v1) và mono (v2/v3/v4) trong 1 lần ffmpeg
-    #    Dùng -t 30 để giới hạn 30s tránh OOM
-    if not run_ffmpeg(
-        f'ffmpeg -y -i "{picked_audio}" -t 30 -ar 44100 -ac 2 "{picked_wav_stereo}" '
-        f'-t 30 -ar 44100 -ac 1 "{picked_wav_mono}"'
-    ):
-        # Fallback: convert riêng từng cái
-        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ar 44100 -ac 2 "{picked_wav_stereo}"')
-        run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ar 44100 -ac 1 "{picked_wav_mono}"')
+    # 3) Convert picked → WAV stereo (v1) và mono (v2/v3/v4), có fallback demuxer.
+    if not _ffmpeg_convert_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono):
+        logger.error(f"[preprocess_shared] Cannot decode heartbeat upload '{picked_audio}'")
+        return {'success': False, 'error': 'heartbeat-decode-failed'}
 
     # 4) Đo volume asset bằng numpy (0 subprocess)
     asset_volume = fast_mean_volume(normalized_asset_path)
@@ -810,24 +877,38 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         mixed_temp_path     = os.path.join(temp_dir, 'mixed_temp.flac')
  
         # ── 1. Shared preprocessing ──────────────────────────────────────────
-        if shared_data and shared_data.get('success'):
+        use_shared = bool(shared_data and shared_data.get('success'))
+        if use_shared:
             temp_wav_path = shared_data['picked_wav_mono']
             normalized_asset_path = shared_data['normalized_asset_path']
             vol_asset = shared_data['asset_volume']
-            logger.info(f"[mix] Using shared preprocessed data")
-        else:
-            logger.info(f"[mix] No shared_data → running local preprocessing")
+            if _is_valid_decoded_audio(temp_wav_path):
+                logger.info(f"[mix] Using shared preprocessed data")
+            else:
+                logger.warning("[mix] Shared heartbeat mono file missing/unreadable, fallback local preprocessing")
+                use_shared = False
+
+        if not use_shared:
+            logger.info(f"[mix] No usable shared_data → running local preprocessing")
             temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
+            temp_wav_stereo_path = os.path.join(temp_dir, 'picked_temp_stereo.wav')
             normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
-            run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
+
+            if not _ffmpeg_convert_heartbeat_variants(picked_audio, temp_wav_stereo_path, temp_wav_path):
+                raise RuntimeError(
+                    "Cannot decode heartbeat upload. Please re-export as PCM WAV, FLAC, or MP3 and try again."
+                )
+
             raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
             if not preconvert_asset(asset_audio, raw_asset_path):
-                logger.error(f"[mix] Cannot decode asset audio '{asset_audio}', aborting.")
-                return
-            run_ffmpeg(
+                raise RuntimeError("Cannot decode background track audio for mixing.")
+
+            if not run_ffmpeg(
                 f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 '
                 f'-af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"'
-            )
+            ):
+                raise RuntimeError("Failed to normalize background track audio for mixing.")
+
             vol_asset = fast_mean_volume(normalized_asset_path)
  
         # ── 2. HPSS denoising ────────────────────────────────────────────────
