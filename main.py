@@ -98,10 +98,10 @@ MIX_OUTPUT_FORMATS = {
 
 
 def resolve_mix_output_format(raw_value: str) -> str:
-    normalized = str(raw_value or "flac").strip().lower()
+    normalized = str(raw_value or "mp3").strip().lower()
     if normalized in MIX_OUTPUT_FORMATS:
         return normalized
-    return "flac"
+    return "mp3"
 
 app = FastAPI(title="Woom Audio Mixer API")
 
@@ -484,7 +484,7 @@ def mix_all(
     background_tasks: BackgroundTasks,
     picked: UploadFile = File(...),
     track_name: str = Form(...),
-    output_format: str = Form("flac"),
+    output_format: str = Form("mp3"),
     debug_status_only: bool = Form(False),
 ):
     """
@@ -545,7 +545,7 @@ def mix_file(
     background_tasks: BackgroundTasks,
     track_name: str = Form(...),
     heartbeat_name: str = Form(...),
-    output_format: str = Form("flac"),
+    output_format: str = Form("mp3"),
     debug_status_only: bool = Form(False),
 ):
     """Mix two existing files from R2: one trackbeat and one heartbeat from library."""
