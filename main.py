@@ -12,8 +12,9 @@ import mimetypes
 import urllib.parse
 import urllib.request
 import urllib.error
+import re
 from functools import lru_cache
-from typing import List
+from typing import List, Dict
 # v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
 from processor import mix_audio_v1, adjust_bpm, preprocess_shared
 
@@ -91,6 +92,7 @@ R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_S3_ENDPOINT = os.getenv("R2_S3_ENDPOINT", "").strip()
 ALLOWED_TRACK_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac"}
+ALLOWED_FILE_TYPES = {"heartbeat", "trackbeat"}
 MIX_OUTPUT_FORMATS = {
     "flac": "audio/flac",
     "mp3": "audio/mpeg",
@@ -179,12 +181,174 @@ def get_r2_s3_client():
 
 def guess_track_file_type(track_name: str) -> str:
     lower_name = (track_name or "").lower()
-    if "heartbeat" in lower_name:
+    if "heartbeat" in lower_name or "heartbeart" in lower_name:
         return "heartbeat"
+
+    # Fallback for short legacy naming variants like *_hb.wav
+    tokens = [token for token in re.split(r"[^a-z0-9]+", lower_name) if token]
+    if "hb" in tokens:
+        return "heartbeat"
+
     return "trackbeat"
 
 
-def list_tracks_from_r2() -> List[str]:
+def normalize_file_type(file_type: str, fallback_track_name: str = "") -> str:
+    """Normalize file_type values so frontend can separate heartbeat and trackbeat reliably."""
+    lowered = str(file_type or "").strip().lower()
+    compact = lowered.replace("-", "").replace("_", "").replace(" ", "")
+
+    if compact in {"heartbeat", "heartbeart", "heart"}:
+        return "heartbeat"
+    if compact in {"trackbeat", "track", "music", "background"}:
+        return "trackbeat"
+    if fallback_track_name:
+        return guess_track_file_type(fallback_track_name)
+    return "trackbeat"
+
+
+def derive_display_name_from_key(object_key: str, fallback_name: str) -> str:
+    """Return a human-readable name for uploaded files from object key patterns."""
+    key_name = os.path.basename(object_key or "")
+    fallback = fallback_name or key_name or "audio.wav"
+
+    modern_match = re.match(
+        r"^upload_(?:heartbeat|trackbeat)_(?:[0-9]{14}_[0-9a-f]{8}_)?(.+)$",
+        key_name,
+        flags=re.IGNORECASE,
+    )
+    if modern_match:
+        candidate = modern_match.group(1).strip()
+        if candidate:
+            return candidate
+
+    legacy_match = re.match(
+        r"^[0-9]{8}T[0-9]{6}Z_[0-9a-f]{8,}_(.+)$",
+        key_name,
+        flags=re.IGNORECASE,
+    )
+    if legacy_match:
+        candidate = legacy_match.group(1).strip()
+        if candidate:
+            return candidate
+
+    return fallback
+
+
+def build_uploaded_track_name(original_name: str, file_type: str, content_type: str = "") -> str:
+    """Create a stable object name so repeated uploads of the same file overwrite instead of duplicating."""
+    normalized_type = normalize_file_type(file_type)
+    safe_name = os.path.basename((original_name or "").strip())
+    stem, ext = os.path.splitext(safe_name)
+    safe_stem = "".join([c for c in stem if c.isalnum() or c in "._-"]).strip("._-")
+    if not safe_stem:
+        safe_stem = normalized_type
+
+    ext = ext.lower()
+    if ext not in ALLOWED_TRACK_EXTENSIONS:
+        guessed_ext = (mimetypes.guess_extension(content_type or "") or "").lower()
+        ext = guessed_ext if guessed_ext in ALLOWED_TRACK_EXTENSIONS else ".wav"
+
+    return f"upload_{normalized_type}_{safe_stem[:80]}{ext}"
+
+
+def upload_track_file_to_r2(
+    *,
+    local_path: str,
+    original_name: str,
+    file_type: str,
+    content_type: str = "",
+) -> str:
+    """Upload a local audio file to R2 with metadata including normalized file_type."""
+    if not os.path.exists(local_path) or os.path.getsize(local_path) <= 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    if not is_r2_s3_ready():
+        raise HTTPException(status_code=503, detail="R2 upload is not configured")
+
+    s3_client = get_r2_s3_client()
+    if s3_client is None:
+        raise HTTPException(status_code=503, detail="R2 upload client is unavailable")
+
+    normalized_type = normalize_file_type(file_type)
+    if normalized_type not in ALLOWED_FILE_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid file_type")
+
+    object_name = build_uploaded_track_name(original_name, normalized_type, content_type)
+    safe_original = "".join([c for c in os.path.basename(original_name or "") if c.isalnum() or c in "._-"])
+    if not safe_original:
+        safe_original = "upload"
+
+    object_content_type = (content_type or mimetypes.guess_type(object_name)[0] or "application/octet-stream").strip()
+    extra_args = {
+        "ContentType": object_content_type,
+        "Metadata": {
+            "file_type": normalized_type,
+            "source": "uploaded",
+            "display_name": safe_original[:120],
+            "original_name": safe_original[:120],
+        },
+    }
+
+    try:
+        with open(local_path, "rb") as file_obj:
+            s3_client.upload_fileobj(file_obj, R2_S3_BUCKET, object_name, ExtraArgs=extra_args)
+    except ClientError as e:
+        logger.error(f"R2 upload failed for '{object_name}': {e}")
+        raise HTTPException(status_code=502, detail="Failed to upload file to R2")
+    except BotoCoreError as e:
+        logger.error(f"R2 upload botocore error for '{object_name}': {e}")
+        raise HTTPException(status_code=502, detail="Failed to upload file to R2")
+    except Exception as e:
+        logger.error(f"Unexpected R2 upload error for '{object_name}': {e}")
+        raise HTTPException(status_code=502, detail="Failed to upload file to R2")
+
+    logger.info(
+        "Uploaded file to R2: key='%s', file_type='%s', size=%s bytes",
+        object_name,
+        normalized_type,
+        os.path.getsize(local_path),
+    )
+    return object_name
+
+
+def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> Dict[str, str]:
+    """Resolve file_type and display_name from object metadata with robust fallbacks."""
+    fallback_type = guess_track_file_type(track_name)
+    fallback_display = derive_display_name_from_key(object_key, track_name)
+
+    try:
+        head_data = s3_client.head_object(Bucket=R2_S3_BUCKET, Key=object_key)
+        metadata = head_data.get("Metadata") or {}
+
+        metadata_type = metadata.get("file_type") or metadata.get("filetype") or ""
+        resolved_type = normalize_file_type(metadata_type, fallback_track_name=track_name)
+
+        metadata_name = (
+            metadata.get("display_name")
+            or metadata.get("original_name")
+            or metadata.get("originalname")
+            or ""
+        )
+        resolved_display = str(metadata_name).strip() or fallback_display
+
+        return {
+            "file_type": resolved_type,
+            "display_name": resolved_display,
+        }
+    except ClientError as e:
+        logger.warning(f"Cannot read metadata for '{object_key}', fallback to derived values. error={e}")
+    except BotoCoreError as e:
+        logger.warning(f"Cannot read metadata for '{object_key}' due to botocore error: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected metadata read error for '{object_key}': {e}")
+
+    return {
+        "file_type": fallback_type,
+        "display_name": fallback_display,
+    }
+
+
+def list_tracks_from_r2() -> List[Dict[str, str]]:
     """List supported audio files from Cloudflare R2 bucket (S3 API)."""
     if not is_r2_s3_ready():
         logger.warning("R2 S3 listing is not ready. Missing config or boto3 package.")
@@ -194,7 +358,7 @@ def list_tracks_from_r2() -> List[str]:
     if s3_client is None:
         return []
 
-    keys: List[str] = []
+    tracks_by_identity: Dict[str, Dict[str, object]] = {}
     continuation_token = None
 
     try:
@@ -211,7 +375,27 @@ def list_tracks_from_r2() -> List[str]:
                     continue
                 ext = os.path.splitext(key_name)[1].lower()
                 if ext in ALLOWED_TRACK_EXTENSIONS:
-                    keys.append(key_name)
+                    resolved_meta = resolve_track_meta_from_r2(s3_client, raw_key, key_name)
+                    display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
+                    identity_key = (
+                        f"{normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name)}"
+                        f"::{display_name.lower()}"
+                    )
+                    candidate = {
+                        "track_name": key_name,
+                        "file_type": resolved_meta["file_type"],
+                        "display_name": display_name,
+                        "_last_modified": item.get("LastModified"),
+                    }
+
+                    existing = tracks_by_identity.get(identity_key)
+                    if existing is None:
+                        tracks_by_identity[identity_key] = candidate
+                    else:
+                        existing_last = existing.get("_last_modified")
+                        candidate_last = candidate.get("_last_modified")
+                        if candidate_last and (not existing_last or candidate_last > existing_last):
+                            tracks_by_identity[identity_key] = candidate
 
             if not response.get("IsTruncated"):
                 break
@@ -229,9 +413,18 @@ def list_tracks_from_r2() -> List[str]:
         logger.error(f"Unexpected error while listing R2 tracks: {e}")
         return []
 
-    deduped = list(dict.fromkeys(keys))
-    deduped.sort(key=lambda item: item.lower())
-    return deduped
+    tracks = []
+    for item in tracks_by_identity.values():
+        tracks.append(
+            {
+                "track_name": str(item.get("track_name") or ""),
+                "file_type": str(item.get("file_type") or "trackbeat"),
+                "display_name": str(item.get("display_name") or item.get("track_name") or ""),
+            }
+        )
+
+    tracks.sort(key=lambda item: item["display_name"].lower())
+    return tracks
 
 
 def download_track_from_r2(track_name: str, temp_dir: str) -> str:
@@ -373,7 +566,22 @@ def generate_mix_results(
         yield emit(3, "progress", "Preprocessing shared audio assets...")
         shared_data = preprocess_shared(asset_path, picked_path, temp_dir)
         if not shared_data.get("success"):
-            logger.error(f"[{endpoint_name}] Shared preprocessing failed; fallback inside mix_audio_v1")
+            shared_error = shared_data.get("error", "shared-preprocess-failed")
+            fatal_error_messages = {
+                "heartbeat-decode-failed": "Heartbeat file is not a valid/decodable audio file.",
+                "asset-decode-failed": "Background track could not be decoded for mixing.",
+                "asset-loudnorm-failed": "Background track normalization failed.",
+            }
+            if shared_error in fatal_error_messages:
+                logger.error(
+                    f"[{endpoint_name}] Shared preprocessing fatal error: {shared_error}"
+                )
+                yield emit(3, "failed", fatal_error_messages[shared_error], error=shared_error)
+                return
+
+            logger.error(
+                f"[{endpoint_name}] Shared preprocessing failed ({shared_error}); fallback inside mix_audio_v1"
+            )
             shared_data = None
 
         logger.info(f"[{endpoint_name}] Step 4/7 - running unified v1 mix")
@@ -440,12 +648,13 @@ def list_tracks():
     tracks = list_tracks_from_r2()
     payload = [
         {
-            "track_name": name,
-            "file_type": guess_track_file_type(name),
-            "file_url": build_r2_track_url(name),
+            "track_name": item["track_name"],
+            "file_type": normalize_file_type(item.get("file_type", ""), fallback_track_name=item["track_name"]),
+            "display_name": item.get("display_name") or item["track_name"],
+            "file_url": build_r2_track_url(item["track_name"]),
             "source": "r2",
         }
-        for name in tracks
+        for item in tracks
     ]
 
     logger.info(f"Returning {len(payload)} tracks from R2 library")
@@ -515,6 +724,32 @@ def mix_all(
             
         file_size = os.path.getsize(picked_path)
         logger.info(f"[/mix-all] Finished uploading and saving user file to disk. Size: {file_size} bytes.")
+
+        uploaded_heartbeat_name = None
+        if is_r2_s3_ready():
+            try:
+                uploaded_heartbeat_name = upload_track_file_to_r2(
+                    local_path=picked_path,
+                    original_name=picked.filename or picked_filename,
+                    file_type="heartbeat",
+                    content_type=picked.content_type or "",
+                )
+                logger.info(
+                    "[/mix-all] Persisted uploaded heartbeat to R2 as '%s' (file_type=heartbeat)",
+                    uploaded_heartbeat_name,
+                )
+            except HTTPException as upload_err:
+                logger.error(
+                    "[/mix-all] Failed to upload heartbeat to R2 (status=%s, detail=%s). Continue mixing with local file.",
+                    upload_err.status_code,
+                    upload_err.detail,
+                )
+            except Exception as upload_err:
+                logger.error(
+                    f"[/mix-all] Unexpected R2 upload error: {upload_err}. Continue mixing with local file."
+                )
+        else:
+            logger.warning("[/mix-all] R2 upload skipped because S3 config is not ready (mix continues locally)")
 
         mix_format = resolve_mix_output_format(output_format)
         logger.info(f"[/mix-all] Requested output format: {mix_format}")
