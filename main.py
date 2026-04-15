@@ -192,6 +192,17 @@ def guess_track_file_type(track_name: str) -> str:
     return "trackbeat"
 
 
+def is_generated_mix_track_name(track_name: str) -> bool:
+    normalized = os.path.basename(str(track_name or "")).strip().lower()
+    if not normalized:
+        return False
+
+    return bool(
+        re.match(r"^mixed[-_][a-f0-9]{8,}(?:[-_][a-f0-9]{8,})*(?:\.[a-z0-9]+)?$", normalized)
+        or re.match(r"^v\d+_mixed(?:\.[a-z0-9]+)?$", normalized)
+    )
+
+
 def normalize_file_type(file_type: str, fallback_track_name: str = "") -> str:
     """Normalize file_type values so frontend can separate heartbeat and trackbeat reliably."""
     lowered = str(file_type or "").strip().lower()
@@ -375,8 +386,14 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
                     continue
                 ext = os.path.splitext(key_name)[1].lower()
                 if ext in ALLOWED_TRACK_EXTENSIONS:
+                    if is_generated_mix_track_name(key_name):
+                        continue
+
                     resolved_meta = resolve_track_meta_from_r2(s3_client, raw_key, key_name)
                     display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
+                    if is_generated_mix_track_name(display_name):
+                        continue
+
                     identity_key = (
                         f"{normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name)}"
                         f"::{display_name.lower()}"
