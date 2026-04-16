@@ -926,25 +926,44 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         stable_dur = len(y_stable) / sr
         logger.info(f"[mix] Stable segment extracted: {stable_dur:.1f}s → {stable_path}")
  
-        # ── 4. BPM sync: chỉ thay đổi heartbeat ≤ 15% với fallback xử lý track nhạc
+        # ── 4. BPM sync: phân bổ tỷ lệ stretch cho cả heartbeat và nhạc nền sao cho sai số ≤ 15%
         heart_tempo = max(40.0, min(180.0, heart_tempo))
         music_tempo = max(50.0, min(220.0, music_tempo))
 
-        raw_rate = music_tempo / heart_tempo
-        MAX_DELTA = 0.15
-        if abs(raw_rate - 1.0) > MAX_DELTA:
-            tempo_rate = 1.0 + math.copysign(MAX_DELTA, raw_rate - 1.0)
-            logger.info(
-                f"[mix] BPM delta lớn: raw_rate={raw_rate:.3f}, clamp tempo_rate={tempo_rate:.3f} (±15%)"
-            )
-        else:
-            tempo_rate = raw_rate
-            logger.info(f"[mix] BPM sync: tempo_rate={tempo_rate:.3f} (within ±15%)")
+        MAX_STRETCH = 0.15
 
-        asset_atempo = None
-        if abs(raw_rate - 1.0) > 0.45:
-            asset_atempo = 0.95 if raw_rate > 1.0 else 1.05
-            logger.info(f"[mix] Mismatch lớn >45%, sẽ apply asset atempo={asset_atempo:.2f} để gần hơn")
+        base_music_tempo = music_tempo
+        # Tìm mức tempo tương đương để so sánh (dựa trên các quãng 8 / octave normalization)
+        while base_music_tempo / heart_tempo > 1.415:
+            base_music_tempo /= 2.0
+        while base_music_tempo / heart_tempo < 0.707:
+            base_music_tempo *= 2.0
+
+        target_sync_rate = base_music_tempo / heart_tempo
+
+        # Tính toán phân bổ cân bằng: heart_stretch / asset_atempo = target_sync_rate
+        raw_heart_rate = math.sqrt(target_sync_rate)
+        
+        # Clamp heart_rate trong khoảng [0.85, 1.15]
+        tempo_rate = max(1.0 - MAX_STRETCH, min(1.0 + MAX_STRETCH, raw_heart_rate))
+        
+        # Tính asset_atempo cần thiết dựa trên tempo_rate đã clamp
+        raw_asset_atempo = tempo_rate / target_sync_rate
+        
+        # Clamp asset_atempo trong khoảng [0.85, 1.15]
+        asset_atempo = max(1.0 - MAX_STRETCH, min(1.0 + MAX_STRETCH, raw_asset_atempo))
+        
+        # Bù trừ thêm cho tempo_rate nếu asset_atempo bị clamp (cố gắng tiến sát target nhất có thể)
+        desired_tempo_rate = asset_atempo * target_sync_rate
+        tempo_rate = max(1.0 - MAX_STRETCH, min(1.0 + MAX_STRETCH, desired_tempo_rate))
+
+        logger.info(
+            f"[mix] BPM sync: target_rate={target_sync_rate:.3f}, "
+            f"heart_stretch={tempo_rate:.3f}, asset_atempo={asset_atempo:.3f} (max ±15%)"
+        )
+
+        if abs(asset_atempo - 1.0) <= 0.005:
+            asset_atempo = None
 
         if asset_atempo is not None:
             stretched_asset_path = os.path.join(temp_dir, 'asset_stretched.wav')
@@ -952,9 +971,9 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                 f'ffmpeg -y -i "{normalized_asset_path}" -af "atempo={asset_atempo}" "{stretched_asset_path}"'
             ):
                 normalized_asset_path = stretched_asset_path
-                logger.info(f"[mix] Asset ngắn tempo xử lý bằng {asset_atempo:.2f}")
+                logger.info(f"[mix] Asset xử lý atempo={asset_atempo:.3f}")
             else:
-                logger.warning(f"[mix] Asset atempo {asset_atempo:.2f} fail -> giữ nguyên asset")
+                logger.warning(f"[mix] Asset atempo {asset_atempo:.3f} fail -> giữ nguyên asset")
  
         if abs(tempo_rate - 1.0) > 0.005:
             # FFmpeg call #1 — atempo stretch heartbeat
