@@ -125,6 +125,29 @@ def cleanup_temp(temp_dir: str):
         logger.error(f"Error during cleanup: {e}")
 
 
+def save_uploadfile_to_disk(upload: UploadFile, destination_path: str) -> int:
+    """Persist UploadFile content to disk and return bytes written."""
+    if upload is None or upload.file is None:
+        return 0
+
+    try:
+        upload.file.seek(0)
+    except Exception:
+        # Some file-like objects are not seekable; continue from current offset.
+        pass
+
+    written = 0
+    with open(destination_path, "wb") as buffer:
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            buffer.write(chunk)
+            written += len(chunk)
+
+    return written
+
+
 def sanitize_track_name(track_name: str) -> str:
     """Allow only plain filenames to avoid path traversal from user input."""
     safe_name = os.path.basename((track_name or "").strip())
@@ -742,12 +765,27 @@ def mix_all(
         if not picked_filename:
             picked_filename = "picked_audio.wav"
         picked_path = os.path.join(temp_dir, f"picked_{picked_filename}")
-        logger.info(f"[/mix-all] Starting to write user uploaded file to local temp disk: {picked_path}")
-        with open(picked_path, "wb") as buffer:
-            shutil.copyfileobj(picked.file, buffer)
-            
-        file_size = os.path.getsize(picked_path)
-        logger.info(f"[/mix-all] Finished uploading and saving user file to disk. Size: {file_size} bytes.")
+        reported_upload_size = getattr(picked, "size", None)
+        logger.info(
+            "[/mix-all] Starting to write user uploaded file to local temp disk: %s (reported_size=%s)",
+            picked_path,
+            reported_upload_size,
+        )
+        written_bytes = save_uploadfile_to_disk(picked, picked_path)
+
+        file_size = os.path.getsize(picked_path) if os.path.exists(picked_path) else 0
+        logger.info(
+            "[/mix-all] Finished uploading and saving user file to disk. Size: %s bytes (written=%s, reported=%s)",
+            file_size,
+            written_bytes,
+            reported_upload_size,
+        )
+        if file_size <= 0:
+            logger.error("[/mix-all] Uploaded heartbeat is empty after persistence. Rejecting request early.")
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded heartbeat file is empty. Please re-select the file and try again.",
+            )
 
         uploaded_heartbeat_name = None
         if is_r2_s3_ready():
@@ -874,11 +912,19 @@ def adjust_bpm_endpoint(
         guessed_ext = (mimetypes.guess_extension(file.content_type or "") or "").lower()
         incoming_ext = guessed_ext if guessed_ext in ALLOWED_TRACK_EXTENSIONS else ".flac"
     input_path = os.path.join(temp_dir, f"input_mix{incoming_ext}")
-    with open(input_path, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    reported_upload_size = getattr(file, "size", None)
+    written_bytes = save_uploadfile_to_disk(file, input_path)
 
-    file_size = os.path.getsize(input_path)
-    logger.info(f"[/adjust-bpm] Finished uploading and saving user file. Saved input file to disk. Size: {file_size} bytes.")
+    file_size = os.path.getsize(input_path) if os.path.exists(input_path) else 0
+    logger.info(
+        "[/adjust-bpm] Finished uploading and saving user file. Saved input file to disk. "
+        "Size: %s bytes (written=%s, reported=%s)",
+        file_size,
+        written_bytes,
+        reported_upload_size,
+    )
+    if file_size <= 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     zip_path = os.path.join(temp_dir, "bpm_adjusted.zip")
     with zipfile.ZipFile(zip_path, "w") as zipf:
