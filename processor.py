@@ -217,6 +217,10 @@ AMBIENT_SYNC_DEVIATION_THRESHOLD = 0.34
 BPM_SYNC_APPLY_EPS = 0.02
 AMBIENT_HEARTBEAT_WEIGHT = 0.30
 STANDARD_HEARTBEAT_WEIGHT = 0.55
+AFFTDN_NF_MIN_DB = -80.0
+AFFTDN_NF_MAX_DB = -20.0
+STANDARD_AFFTDN_NF_DB = -20.0
+AMBIENT_AFFTDN_NF_DB = -24.0
 
 
 def _clamp_tempo_rate(rate: float, max_stretch: float = MAX_BPM_STRETCH) -> float:
@@ -503,6 +507,13 @@ def safe_db(value: float, fallback: float = 0.0, limit: float = 40.0) -> float:
     if value is None or math.isnan(value) or math.isinf(value):
         return fallback
     return max(-limit, min(limit, value))
+
+
+def safe_afftdn_nf(value: float, fallback: float = STANDARD_AFFTDN_NF_DB) -> float:
+    """Clamp afftdn `nf` to FFmpeg's valid range [-80, -20] dB."""
+    if value is None or math.isnan(value) or math.isinf(value):
+        value = fallback
+    return max(AFFTDN_NF_MIN_DB, min(AFFTDN_NF_MAX_DB, value))
 
 def safe_ffmpeg_load(path, timeout=FFMPEG_TIMEOUT):
     """Load audio file as AudioSegment by converting to WAV via our controlled
@@ -1103,7 +1114,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"volume={safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6))}dB,"
             f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
             f"stereowiden=delay=5,"
-            f"afftdn=nf=-20,"
+            f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f},"
             f"aloop=loop=-1:size={int(heart_len_s * sr)}"
             f"[a1];"
         )
@@ -1116,7 +1127,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                 f"volume={safe_db(max(0, diff + 0) + 2)}dB,"
                 f"acompressor=threshold=-20dB:ratio=1.2:attack=12:release=140,"
                 f"stereowiden=delay=4,"
-                f"afftdn=nf=-18,"
+                f"afftdn=nf={safe_afftdn_nf(AMBIENT_AFFTDN_NF_DB):.1f},"
                 f"aloop=loop=-1:size={int(heart_len_s * sr)}"
                 f"[a1];"
             )
@@ -1128,11 +1139,37 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"[a]"
         )
         enc = codec_args(mixed_temp_path)
-        if not run_ffmpeg(
+        primary_mix_ok = run_ffmpeg(
             f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" '
             f'-filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
-        ):
-            logger.error("[mix] Final mix FFmpeg call failed")
+        )
+
+        if not primary_mix_ok:
+            logger.warning("[mix] Primary filter chain failed, retrying with safe fallback mix chain")
+            fallback_picked_filter = (
+                f"[1:a]"
+                f"highpass=f=55,lowpass=f=380,"
+                f"volume='{heartbeat_intro_envelope}':eval=frame,"
+                f"volume={safe_db(max(0, diff) + (1 if bpm_mode == 'ambient-texture' else 3))}dB,"
+                f"acompressor=threshold=-20dB:ratio=1.4:attack=10:release=120,"
+                f"afftdn=nf={safe_afftdn_nf(-24.0):.1f},"
+                f"aloop=loop=-1:size={int(heart_len_s * sr)}"
+                f"[a1];"
+            )
+            fallback_mix_filter = (
+                f"{asset_filter}{fallback_picked_filter}"
+                f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
+                f":weights=0.68 0.32,"
+                f"alimiter=limit=0.9"
+                f"[a]"
+            )
+            primary_mix_ok = run_ffmpeg(
+                f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" '
+                f'-filter_complex "{fallback_mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
+            )
+
+        if not primary_mix_ok:
+            logger.error("[mix] Final mix FFmpeg call failed after safe fallback")
             return
 
         is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
