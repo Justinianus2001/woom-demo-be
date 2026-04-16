@@ -571,16 +571,8 @@ def generate_mix_results(
     try:
         from processor import calculate_duration_from_analysis, detect_tempo
 
-        logger.info(f"[{endpoint_name}] Step 1/7 - analyzing heartbeat tempo")
-        yield emit(1, "progress", "Analyzing heartbeat tempo...")
-        heart_duration, heart_tempo = calculate_duration_from_analysis(picked_path)
-
-        logger.info(f"[{endpoint_name}] Step 2/7 - analyzing track tempo")
-        yield emit(2, "progress", "Analyzing track tempo...")
-        music_tempo = detect_tempo(asset_path)
-
-        logger.info(f"[{endpoint_name}] Step 3/7 - shared preprocessing")
-        yield emit(3, "progress", "Preprocessing shared audio assets...")
+        logger.info(f"[{endpoint_name}] Step 1/7 - shared preprocessing")
+        yield emit(1, "progress", "Preprocessing shared audio assets...")
         shared_data = preprocess_shared(asset_path, picked_path, temp_dir)
         if not shared_data.get("success"):
             shared_error = shared_data.get("error", "shared-preprocess-failed")
@@ -600,6 +592,21 @@ def generate_mix_results(
                 f"[{endpoint_name}] Shared preprocessing failed ({shared_error}); fallback inside mix_audio_v1"
             )
             shared_data = None
+
+        analysis_heartbeat_path = picked_path
+        analysis_track_path = asset_path
+        if shared_data:
+            # Analyze BPM on already-decoded WAV inputs to avoid repeated format probing.
+            analysis_heartbeat_path = shared_data.get("picked_wav_mono", picked_path)
+            analysis_track_path = shared_data.get("normalized_asset_path", asset_path)
+
+        logger.info(f"[{endpoint_name}] Step 2/7 - analyzing heartbeat tempo")
+        yield emit(2, "progress", "Analyzing heartbeat tempo...")
+        heart_duration, heart_tempo = calculate_duration_from_analysis(analysis_heartbeat_path)
+
+        logger.info(f"[{endpoint_name}] Step 3/7 - analyzing track tempo")
+        yield emit(3, "progress", "Analyzing track tempo...")
+        music_tempo = detect_tempo(analysis_track_path)
 
         logger.info(f"[{endpoint_name}] Step 4/7 - running unified v1 mix")
         yield emit(4, "progress", "Mixing heartbeat with track...")

@@ -131,7 +131,7 @@ def _librosa_load_safe(audio_path: str, duration: float = 30.0):
             import subprocess as _sp, shlex as _shlex
             try:
                 result = _sp.run(_shlex.split(cmd), stdin=_sp.DEVNULL,
-                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=60)
+                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=ANALYSIS_FFMPEG_TIMEOUT_SECONDS)
                 if result.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
                     converted = True
                     break
@@ -152,7 +152,7 @@ def _librosa_load_safe(audio_path: str, duration: float = 30.0):
 def calculate_duration_from_analysis(picked_audio, num_beats=4):
     """Phân tích file để lấy duration chính xác cho N nhịp tim."""
     try:
-        y, sr = _librosa_load_safe(picked_audio, duration=30.0)
+        y, sr = _librosa_load_safe(picked_audio, duration=HEARTBEAT_ANALYSIS_SECONDS)
         if len(y) == 0:
             return None, 120.0
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
@@ -171,7 +171,7 @@ def calculate_duration_from_analysis(picked_audio, num_beats=4):
 def detect_tempo(audio_path):
     """Tự detect tempo của file audio dùng Librosa."""
     try:
-        y, sr = _librosa_load_safe(audio_path, duration=60.0)
+        y, sr = _librosa_load_safe(audio_path, duration=TRACK_ANALYSIS_SECONDS)
         if len(y) == 0:
             return 120.0
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
@@ -197,6 +197,9 @@ MIN_REASONABLE_MIX_SECONDS = 8.0
 MIN_DURATION_RATIO_VS_ASSET = 0.55
 SILENT_DBFS_THRESHOLD = -70.0
 MIN_PRECONVERT_ASSET_SECONDS = 8.0
+HEARTBEAT_ANALYSIS_SECONDS = 16.0
+TRACK_ANALYSIS_SECONDS = 24.0
+ANALYSIS_FFMPEG_TIMEOUT_SECONDS = 18
 
 HEARTBEAT_INPUT_STRATEGIES = [
     ("auto_large_probe", "-probesize 50M -analyzeduration 100M"),
@@ -207,6 +210,96 @@ HEARTBEAT_INPUT_STRATEGIES = [
     ("mp4", "-f mp4"),
     ("mp3", "-f mp3"),
 ]
+
+MAX_BPM_STRETCH = 0.15
+AMBIENT_TRACK_BPM_THRESHOLD = 95.0
+AMBIENT_SYNC_DEVIATION_THRESHOLD = 0.34
+BPM_SYNC_APPLY_EPS = 0.02
+AMBIENT_HEARTBEAT_WEIGHT = 0.30
+STANDARD_HEARTBEAT_WEIGHT = 0.55
+
+
+def _clamp_tempo_rate(rate: float, max_stretch: float = MAX_BPM_STRETCH) -> float:
+    return max(1.0 - max_stretch, min(1.0 + max_stretch, rate))
+
+
+def _normalize_music_tempo_for_sync(music_tempo: float, heart_tempo: float) -> tuple[float, int]:
+    """Normalize music tempo by octaves so comparison against heartbeat is meaningful."""
+    normalized = float(music_tempo)
+    shift = 0
+    if normalized <= 0 or heart_tempo <= 0:
+        return normalized, shift
+
+    while normalized / heart_tempo > 1.415 and shift > -4:
+        normalized /= 2.0
+        shift -= 1
+    while normalized / heart_tempo < 0.707 and shift < 4:
+        normalized *= 2.0
+        shift += 1
+    return normalized, shift
+
+
+def _plan_bpm_sync_adjustments(heart_tempo: float, music_tempo: float, max_stretch: float = MAX_BPM_STRETCH):
+    """Pick a fast BPM sync plan that favors natural blending over hard matching.
+
+    Ambient or low-BPM tracks are treated as texture beds: keep the trackbeat
+    untouched and only soften or skip heartbeat stretching. For regular rhythmic
+    material, keep the heartbeat within the original ±15% envelope.
+    """
+    heart_tempo = float(heart_tempo or 120.0)
+    music_tempo = float(music_tempo or 120.0)
+
+    normalized_music_tempo, music_octave_shift = _normalize_music_tempo_for_sync(music_tempo, heart_tempo)
+    exact_ratio = normalized_music_tempo / max(heart_tempo, 1e-9)
+    ratio_deviation = abs(math.log(max(exact_ratio, 1e-9)))
+    ambient_mode = normalized_music_tempo <= AMBIENT_TRACK_BPM_THRESHOLD or ratio_deviation >= AMBIENT_SYNC_DEVIATION_THRESHOLD
+
+    best_plan = {
+        "score": float("inf"),
+        "music_tempo": normalized_music_tempo,
+        "music_octave_shift": music_octave_shift,
+        "heart_rate": 1.0,
+        "asset_rate": 1.0,
+        "adjusted_heart_tempo": heart_tempo,
+        "adjusted_music_tempo": normalized_music_tempo,
+        "residual_ratio": exact_ratio,
+        "exact_ratio": exact_ratio,
+        "policy_mode": "ambient-texture" if ambient_mode else "light-sync",
+        "heart_limit": 0.0 if ambient_mode else max_stretch,
+        "asset_limit": 0.0,
+        "heart_weight": AMBIENT_HEARTBEAT_WEIGHT if ambient_mode else STANDARD_HEARTBEAT_WEIGHT,
+        "asset_weight": 1.0 - (AMBIENT_HEARTBEAT_WEIGHT if ambient_mode else STANDARD_HEARTBEAT_WEIGHT),
+    }
+
+    if heart_tempo <= 0 or music_tempo <= 0:
+        return best_plan
+
+    if ambient_mode:
+        # Ambient/low-BPM tracks sound better as a bed when we do not force sync.
+        # Keep heartbeat intact and reduce its prominence in the mix instead.
+        best_plan["heart_rate"] = 1.0
+        best_plan["adjusted_heart_tempo"] = heart_tempo
+        best_plan["adjusted_music_tempo"] = normalized_music_tempo
+        best_plan["heart_limit"] = 0.0
+        best_plan["asset_limit"] = 0.0
+        best_plan["residual_ratio"] = exact_ratio
+        best_plan["policy_mode"] = "ambient-texture"
+        best_plan["heart_weight"] = AMBIENT_HEARTBEAT_WEIGHT
+        best_plan["asset_weight"] = 1.0 - AMBIENT_HEARTBEAT_WEIGHT
+        return best_plan
+
+    heart_rate = _clamp_tempo_rate(exact_ratio, max_stretch=max_stretch)
+    best_plan["heart_rate"] = heart_rate
+    best_plan["adjusted_heart_tempo"] = heart_tempo * heart_rate
+    best_plan["adjusted_music_tempo"] = normalized_music_tempo
+    best_plan["residual_ratio"] = normalized_music_tempo / max(best_plan["adjusted_heart_tempo"], 1e-9)
+    best_plan["policy_mode"] = "light-sync"
+    best_plan["heart_limit"] = max_stretch
+    best_plan["asset_limit"] = 0.0
+    best_plan["heart_weight"] = STANDARD_HEARTBEAT_WEIGHT
+    best_plan["asset_weight"] = 1.0 - STANDARD_HEARTBEAT_WEIGHT
+
+    return best_plan
 
 
 def preconvert_asset(asset_audio: str, output_path: str) -> bool:
@@ -926,57 +1019,30 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         stable_dur = len(y_stable) / sr
         logger.info(f"[mix] Stable segment extracted: {stable_dur:.1f}s → {stable_path}")
  
-        # ── 4. BPM sync: phân bổ tỷ lệ stretch cho cả heartbeat và nhạc nền sao cho sai số ≤ 15%
+        # ── 4. BPM sync: thử nhiều phương án trong biên ±15% rồi chọn phương án nghe tự nhiên nhất
         heart_tempo = max(40.0, min(180.0, heart_tempo))
         music_tempo = max(50.0, min(220.0, music_tempo))
 
-        MAX_STRETCH = 0.15
-
-        base_music_tempo = music_tempo
-        # Tìm mức tempo tương đương để so sánh (dựa trên các quãng 8 / octave normalization)
-        while base_music_tempo / heart_tempo > 1.415:
-            base_music_tempo /= 2.0
-        while base_music_tempo / heart_tempo < 0.707:
-            base_music_tempo *= 2.0
-
-        target_sync_rate = base_music_tempo / heart_tempo
-
-        # Tính toán phân bổ cân bằng: heart_stretch / asset_atempo = target_sync_rate
-        raw_heart_rate = math.sqrt(target_sync_rate)
-        
-        # Clamp heart_rate trong khoảng [0.85, 1.15]
-        tempo_rate = max(1.0 - MAX_STRETCH, min(1.0 + MAX_STRETCH, raw_heart_rate))
-        
-        # Tính asset_atempo cần thiết dựa trên tempo_rate đã clamp
-        raw_asset_atempo = tempo_rate / target_sync_rate
-        
-        # Clamp asset_atempo trong khoảng [0.85, 1.15]
-        asset_atempo = max(1.0 - MAX_STRETCH, min(1.0 + MAX_STRETCH, raw_asset_atempo))
-        
-        # Bù trừ thêm cho tempo_rate nếu asset_atempo bị clamp (cố gắng tiến sát target nhất có thể)
-        desired_tempo_rate = asset_atempo * target_sync_rate
-        tempo_rate = max(1.0 - MAX_STRETCH, min(1.0 + MAX_STRETCH, desired_tempo_rate))
+        bpm_plan = _plan_bpm_sync_adjustments(heart_tempo, music_tempo)
+        tempo_rate = bpm_plan["heart_rate"]
+        bpm_mode = bpm_plan.get("policy_mode", "light-sync")
+        asset_weight = float(bpm_plan.get("asset_weight", 0.45))
+        heart_weight = float(bpm_plan.get("heart_weight", 0.55))
 
         logger.info(
-            f"[mix] BPM sync: target_rate={target_sync_rate:.3f}, "
-            f"heart_stretch={tempo_rate:.3f}, asset_atempo={asset_atempo:.3f} (max ±15%)"
+            f"[mix] BPM sync plan: policy={bpm_plan.get('policy_mode', 'standard')}, "
+            f"limit_heart=±{(bpm_plan.get('heart_limit', MAX_BPM_STRETCH) * 100):.0f}%, "
+            f"limit_asset=±{(bpm_plan.get('asset_limit', 0.0) * 100):.0f}%, "
+            f"music_octave_shift={bpm_plan['music_octave_shift']}, "
+            f"exact_ratio={bpm_plan['exact_ratio']:.3f}, residual_ratio={bpm_plan['residual_ratio']:.3f}, "
+            f"heart_stretch={tempo_rate:.3f}"
+        )
+        logger.info(
+            f"[mix] BPM values: heartbeat_raw={heart_tempo:.1f} -> heartbeat_adjusted={bpm_plan['adjusted_heart_tempo']:.1f}, "
+            f"track_raw={music_tempo:.1f}, track_effective={bpm_plan['music_tempo']:.1f}"
         )
 
-        if abs(asset_atempo - 1.0) <= 0.005:
-            asset_atempo = None
-
-        if asset_atempo is not None:
-            stretched_asset_path = os.path.join(temp_dir, 'asset_stretched.wav')
-            if run_ffmpeg(
-                f'ffmpeg -y -i "{normalized_asset_path}" -af "atempo={asset_atempo}" "{stretched_asset_path}"'
-            ):
-                normalized_asset_path = stretched_asset_path
-                logger.info(f"[mix] Asset xử lý atempo={asset_atempo:.3f}")
-            else:
-                logger.warning(f"[mix] Asset atempo {asset_atempo:.3f} fail -> giữ nguyên asset")
- 
-        if abs(tempo_rate - 1.0) > 0.005:
-            # FFmpeg call #1 — atempo stretch heartbeat
+        if abs(tempo_rate - 1.0) > BPM_SYNC_APPLY_EPS:
             atempo_str = get_atempo_filter(tempo_rate)
             if not run_ffmpeg(
                 f'ffmpeg -y -i "{stable_path}" -filter:a "{atempo_str}" "{stretched_path}"'
@@ -990,9 +1056,10 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         # ── 5. Normalize heartbeat ───────────────────────────────────────────
         picked_seg = AudioSegment.from_file(stretched_path, format='wav').normalize()
         # RMS boost nếu signal sparse (HPSS percussive)
-        target_rms_dbfs = -12.0
+        target_rms_dbfs = -16.0 if bpm_mode == "ambient-texture" else -12.0
         if picked_seg.dBFS < target_rms_dbfs:
-            boost = min(target_rms_dbfs - picked_seg.dBFS, 18.0)
+            boost_cap = 12.0 if bpm_mode == "ambient-texture" else 18.0
+            boost = min(target_rms_dbfs - picked_seg.dBFS, boost_cap)
             picked_seg = picked_seg + boost
             logger.info(f"[mix] RMS boost: +{boost:.1f}dB")
         picked_seg.export(normalized_picked_path, format="wav")
@@ -1019,7 +1086,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"[0:a]"
             f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
             f"equalizer=f=100:width_type=o:width=2:g=-5,"
-            f"volume={safe_db(max(0, -diff) - 3)}dB"
+            f"volume={safe_db(max(0, -diff) - (2 if bpm_mode == 'ambient-texture' else 3))}dB"
             f"[a0];"
         )
         heartbeat_ramp_end_s = HEARTBEAT_SILENT_LEAD_SECONDS + HEARTBEAT_VOLUME_RAMP_SECONDS
@@ -1033,17 +1100,30 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"highpass=f=60,lowpass=f=350,"
             f"bass=g=4:f=80,"
             f"volume='{heartbeat_intro_envelope}':eval=frame,"
-            f"volume={safe_db(max(2, diff + 2) + 6)}dB,"
+            f"volume={safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6))}dB,"
             f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
             f"stereowiden=delay=5,"
             f"afftdn=nf=-20,"
             f"aloop=loop=-1:size={int(heart_len_s * sr)}"
             f"[a1];"
         )
+        if bpm_mode == "ambient-texture":
+            picked_filter = (
+                f"[1:a]"
+                f"highpass=f=50,lowpass=f=420,"
+                f"bass=g=2:f=80,"
+                f"volume='{heartbeat_intro_envelope}':eval=frame,"
+                f"volume={safe_db(max(0, diff + 0) + 2)}dB,"
+                f"acompressor=threshold=-20dB:ratio=1.2:attack=12:release=140,"
+                f"stereowiden=delay=4,"
+                f"afftdn=nf=-18,"
+                f"aloop=loop=-1:size={int(heart_len_s * sr)}"
+                f"[a1];"
+            )
         mix_filter = (
             f"{asset_filter}{picked_filter}"
             f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
-            f":weights=0.4 0.6,"
+            f":weights={asset_weight:.2f} {heart_weight:.2f},"
             f"alimiter=limit=0.9"
             f"[a]"
         )
