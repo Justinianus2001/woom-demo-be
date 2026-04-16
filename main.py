@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
@@ -737,6 +737,7 @@ def get_track_audio(track_name: str):
 
 @app.post("/mix-all")
 def mix_all(
+    request: Request,
     background_tasks: BackgroundTasks,
     picked: UploadFile = File(...),
     track_name: str = Form(...),
@@ -781,7 +782,15 @@ def mix_all(
             reported_upload_size,
         )
         if file_size <= 0:
-            logger.error("[/mix-all] Uploaded heartbeat is empty after persistence. Rejecting request early.")
+            logger.error(
+                "[/mix-all] Uploaded heartbeat is empty after persistence. "
+                "Rejecting request early. request_content_length=%s request_content_type=%s "
+                "upload_filename=%s upload_content_type=%s",
+                request.headers.get("content-length"),
+                request.headers.get("content-type"),
+                picked.filename,
+                picked.content_type,
+            )
             raise HTTPException(
                 status_code=400,
                 detail="Uploaded heartbeat file is empty. Please re-select the file and try again.",

@@ -1037,8 +1037,6 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         bpm_plan = _plan_bpm_sync_adjustments(heart_tempo, music_tempo)
         tempo_rate = bpm_plan["heart_rate"]
         bpm_mode = bpm_plan.get("policy_mode", "light-sync")
-        asset_weight = float(bpm_plan.get("asset_weight", 0.45))
-        heart_weight = float(bpm_plan.get("heart_weight", 0.55))
 
         logger.info(
             f"[mix] BPM sync plan: policy={bpm_plan.get('policy_mode', 'standard')}, "
@@ -1134,7 +1132,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         mix_filter = (
             f"{asset_filter}{picked_filter}"
             f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
-            f":weights={asset_weight:.2f} {heart_weight:.2f},"
+            f":weights=0.45 0.55,"
             f"alimiter=limit=0.9"
             f"[a]"
         )
@@ -1159,7 +1157,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             fallback_mix_filter = (
                 f"{asset_filter}{fallback_picked_filter}"
                 f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
-                f":weights=0.68 0.32,"
+                f":weights=0.45 0.55,"
                 f"alimiter=limit=0.9"
                 f"[a]"
             )
@@ -1196,7 +1194,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                 f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
                 f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
                 f"[a1];"
-                f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1,"
+                f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights=0.45 0.55,"
                 f"alimiter=limit=0.92"
                 f"[a]"
             )
