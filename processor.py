@@ -221,6 +221,9 @@ AFFTDN_NF_MIN_DB = -80.0
 AFFTDN_NF_MAX_DB = -20.0
 STANDARD_AFFTDN_NF_DB = -20.0
 AMBIENT_AFFTDN_NF_DB = -24.0
+HEARTBEAT_LOOP_CROSSFADE_MS = 120
+HEARTBEAT_LOOP_INTRO_SILENCE_MS = int(HEARTBEAT_SILENT_LEAD_SECONDS * 1000)
+HEARTBEAT_LOOP_INTRO_RAMP_MS = int(HEARTBEAT_VOLUME_RAMP_SECONDS * 1000)
 
 
 def _clamp_tempo_rate(rate: float, max_stretch: float = MAX_BPM_STRETCH) -> float:
@@ -619,6 +622,57 @@ def evaluate_mixed_output(mix_path: str, expected_asset_duration: float = 0.0):
         return False, f"too-silent:{measured_dbfs:.2f}dBFS", measured_duration, measured_dbfs
 
     return True, "ok", measured_duration, measured_dbfs
+
+
+def _build_looped_heartbeat_bed(
+    source_path: str,
+    output_path: str,
+    target_duration_s: float,
+    crossfade_ms: int = HEARTBEAT_LOOP_CROSSFADE_MS,
+    intro_silence_ms: int = HEARTBEAT_LOOP_INTRO_SILENCE_MS,
+    intro_ramp_ms: int = HEARTBEAT_LOOP_INTRO_RAMP_MS,
+) -> bool:
+    """Render a finite heartbeat bed with a one-time intro and seamless joins."""
+    try:
+        source = AudioSegment.from_file(source_path, format='wav')
+    except Exception as e:
+        logger.warning(f"[mix] Cannot load loop bed source '{source_path}': {e}")
+        return False
+
+    if len(source) == 0 or target_duration_s <= 0:
+        return False
+
+    crossfade_ms = max(0, min(int(crossfade_ms), len(source) // 4, 250))
+    intro_silence_ms = max(0, int(intro_silence_ms))
+    intro_ramp_ms = max(0, int(intro_ramp_ms))
+
+    bed = AudioSegment.silent(duration=intro_silence_ms)
+    first_segment = source.fade_in(intro_ramp_ms) if intro_ramp_ms > 0 else source
+    bed += first_segment
+
+    target_ms = max(int(target_duration_s * 1000.0), len(bed))
+    safety_limit_ms = max(target_ms + len(source), target_ms * 3)
+
+    while len(bed) < target_ms:
+        if crossfade_ms > 0 and len(source) > crossfade_ms:
+            bed = bed.append(source, crossfade=crossfade_ms)
+        else:
+            bed += source
+
+        if len(bed) > safety_limit_ms:
+            logger.warning(f"[mix] Loop bed generation exceeded safety limit for '{source_path}'")
+            break
+
+    if len(bed) > target_ms + crossfade_ms:
+        bed = bed[:target_ms]
+
+    try:
+        bed.export(output_path, format='wav')
+    except Exception as e:
+        logger.warning(f"[mix] Failed to export loop bed '{output_path}': {e}")
+        return False
+
+    return _is_valid_decoded_audio(output_path)
 
 
 def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
@@ -1080,16 +1134,36 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         diff = vol_asset - vol_picked
         logger.info(f"[mix] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB, diff={diff:.1f}dB")
 
-        # ── 7. FFmpeg mix ─────────────────────────────────────────────────────
-        # adelay=4000ms → nhạc nền bắt đầu sau 4 giây.
-        # Heartbeat loop vô hạn: fade-in/out sẽ được apply ở step 8
-        # SAU khi mix (finite output), tránh bị amix+alimiter nuốt mất fade.
+        # ── 7. Prepare a finite heartbeat bed + mix ─────────────────────────
+        # Heartbeat bed chỉ có intro silence/ramp ở lần đầu, các lần lặp dùng crossfade
+        # để loại bỏ khe nghỉ và tránh cảm giác loop bị khựng.
         try:
             asset_dur_s = float(sf.info(normalized_asset_path).duration)
             logger.info(f"[mix] Asset WAV duration: {asset_dur_s:.1f}s")
         except Exception as e:
             logger.warning(f"[mix] sf.info WAV failed ({e}), skip duration threshold check")
             asset_dur_s = 0.0
+
+        heartbeat_bed_path = os.path.join(temp_dir, 'picked_loopbed.wav')
+        heartbeat_bed_target_s = max(
+            asset_dur_s + INTRO_SECONDS + FADE_OUT_SECONDS + 2.0,
+            heart_len_s * 4.0,
+            INTRO_SECONDS + 12.0,
+        )
+        loop_bed_ready = _build_looped_heartbeat_bed(
+            normalized_picked_path,
+            heartbeat_bed_path,
+            heartbeat_bed_target_s,
+        )
+        if loop_bed_ready:
+            picked_mix_input_path = heartbeat_bed_path
+            logger.info(
+                f"[mix] Loop bed ready: target={heartbeat_bed_target_s:.1f}s, "
+                f"crossfade={HEARTBEAT_LOOP_CROSSFADE_MS}ms"
+            )
+        else:
+            picked_mix_input_path = normalized_picked_path
+            logger.warning("[mix] Loop bed build failed, falling back to legacy heartbeat input")
 
         asset_filter = (
             f"[0:a]"
@@ -1098,37 +1172,60 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"volume={safe_db(max(0, -diff) - (2 if bpm_mode == 'ambient-texture' else 3))}dB"
             f"[a0];"
         )
-        heartbeat_ramp_end_s = HEARTBEAT_SILENT_LEAD_SECONDS + HEARTBEAT_VOLUME_RAMP_SECONDS
-        heartbeat_intro_envelope = (
-            f"if(lt(t,{HEARTBEAT_SILENT_LEAD_SECONDS:.2f}),0,"
-            f"if(lt(t,{heartbeat_ramp_end_s:.2f}),"
-            f"(t-{HEARTBEAT_SILENT_LEAD_SECONDS:.2f})/{HEARTBEAT_VOLUME_RAMP_SECONDS:.2f},1))"
-        )
-        picked_filter = (
-            f"[1:a]"
-            f"highpass=f=60,lowpass=f=350,"
-            f"bass=g=4:f=80,"
-            f"volume='{heartbeat_intro_envelope}':eval=frame,"
-            f"volume={safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6))}dB,"
-            f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
-            f"stereowiden=delay=5,"
-            f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f},"
-            f"aloop=loop=-1:size={int(heart_len_s * sr)}"
-            f"[a1];"
-        )
-        if bpm_mode == "ambient-texture":
+        if loop_bed_ready:
             picked_filter = (
                 f"[1:a]"
-                f"highpass=f=50,lowpass=f=420,"
-                f"bass=g=2:f=80,"
+                f"highpass=f=60,lowpass=f=350,"
+                f"bass=g=4:f=80,"
+                f"volume={safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6))}dB,"
+                f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
+                f"stereowiden=delay=5,"
+                f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f}"
+                f"[a1];"
+            )
+            if bpm_mode == "ambient-texture":
+                picked_filter = (
+                    f"[1:a]"
+                    f"highpass=f=50,lowpass=f=420,"
+                    f"bass=g=2:f=80,"
+                    f"volume={safe_db(max(0, diff + 0) + 2)}dB,"
+                    f"acompressor=threshold=-20dB:ratio=1.2:attack=12:release=140,"
+                    f"stereowiden=delay=4,"
+                    f"afftdn=nf={safe_afftdn_nf(AMBIENT_AFFTDN_NF_DB):.1f}"
+                    f"[a1];"
+                )
+        else:
+            heartbeat_ramp_end_s = HEARTBEAT_SILENT_LEAD_SECONDS + HEARTBEAT_VOLUME_RAMP_SECONDS
+            heartbeat_intro_envelope = (
+                f"if(lt(t,{HEARTBEAT_SILENT_LEAD_SECONDS:.2f}),0,"
+                f"if(lt(t,{heartbeat_ramp_end_s:.2f}),"
+                f"(t-{HEARTBEAT_SILENT_LEAD_SECONDS:.2f})/{HEARTBEAT_VOLUME_RAMP_SECONDS:.2f},1))"
+            )
+            picked_filter = (
+                f"[1:a]"
+                f"highpass=f=60,lowpass=f=350,"
+                f"bass=g=4:f=80,"
                 f"volume='{heartbeat_intro_envelope}':eval=frame,"
-                f"volume={safe_db(max(0, diff + 0) + 2)}dB,"
-                f"acompressor=threshold=-20dB:ratio=1.2:attack=12:release=140,"
-                f"stereowiden=delay=4,"
-                f"afftdn=nf={safe_afftdn_nf(AMBIENT_AFFTDN_NF_DB):.1f},"
+                f"volume={safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6))}dB,"
+                f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
+                f"stereowiden=delay=5,"
+                f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f},"
                 f"aloop=loop=-1:size={int(heart_len_s * sr)}"
                 f"[a1];"
             )
+            if bpm_mode == "ambient-texture":
+                picked_filter = (
+                    f"[1:a]"
+                    f"highpass=f=50,lowpass=f=420,"
+                    f"bass=g=2:f=80,"
+                    f"volume='{heartbeat_intro_envelope}':eval=frame,"
+                    f"volume={safe_db(max(0, diff + 0) + 2)}dB,"
+                    f"acompressor=threshold=-20dB:ratio=1.2:attack=12:release=140,"
+                    f"stereowiden=delay=4,"
+                    f"afftdn=nf={safe_afftdn_nf(AMBIENT_AFFTDN_NF_DB):.1f},"
+                    f"aloop=loop=-1:size={int(heart_len_s * sr)}"
+                    f"[a1];"
+                )
         mix_filter = (
             f"{asset_filter}{picked_filter}"
             f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
@@ -1137,23 +1234,34 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"[a]"
         )
         enc = codec_args(mixed_temp_path)
+        picked_mix_input_flag = f'"{picked_mix_input_path}"'
         primary_mix_ok = run_ffmpeg(
-            f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" '
+            f'ffmpeg -y -i "{normalized_asset_path}" -i {picked_mix_input_flag} '
             f'-filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
         )
 
         if not primary_mix_ok:
             logger.warning("[mix] Primary filter chain failed, retrying with safe fallback mix chain")
-            fallback_picked_filter = (
-                f"[1:a]"
-                f"highpass=f=55,lowpass=f=380,"
-                f"volume='{heartbeat_intro_envelope}':eval=frame,"
-                f"volume={safe_db(max(0, diff) + (1 if bpm_mode == 'ambient-texture' else 3))}dB,"
-                f"acompressor=threshold=-20dB:ratio=1.4:attack=10:release=120,"
-                f"afftdn=nf={safe_afftdn_nf(-24.0):.1f},"
-                f"aloop=loop=-1:size={int(heart_len_s * sr)}"
-                f"[a1];"
-            )
+            if loop_bed_ready:
+                fallback_picked_filter = (
+                    f"[1:a]"
+                    f"highpass=f=55,lowpass=f=380,"
+                    f"volume={safe_db(max(0, diff) + (1 if bpm_mode == 'ambient-texture' else 3))}dB,"
+                    f"acompressor=threshold=-20dB:ratio=1.4:attack=10:release=120,"
+                    f"afftdn=nf={safe_afftdn_nf(-24.0):.1f}"
+                    f"[a1];"
+                )
+            else:
+                fallback_picked_filter = (
+                    f"[1:a]"
+                    f"highpass=f=55,lowpass=f=380,"
+                    f"volume='{heartbeat_intro_envelope}':eval=frame,"
+                    f"volume={safe_db(max(0, diff) + (1 if bpm_mode == 'ambient-texture' else 3))}dB,"
+                    f"acompressor=threshold=-20dB:ratio=1.4:attack=10:release=120,"
+                    f"afftdn=nf={safe_afftdn_nf(-24.0):.1f},"
+                    f"aloop=loop=-1:size={int(heart_len_s * sr)}"
+                    f"[a1];"
+                )
             fallback_mix_filter = (
                 f"{asset_filter}{fallback_picked_filter}"
                 f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
@@ -1161,8 +1269,9 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                 f"alimiter=limit=0.9"
                 f"[a]"
             )
+            fallback_input_flag = picked_mix_input_flag if loop_bed_ready else f'-i "{normalized_picked_path}"'
             primary_mix_ok = run_ffmpeg(
-                f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" '
+                f'ffmpeg -y -i "{normalized_asset_path}" {fallback_input_flag} '
                 f'-filter_complex "{fallback_mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
             )
 
@@ -1182,24 +1291,42 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         if not is_healthy:
             fallback_mixed_path = os.path.join(temp_dir, 'mixed_temp_fallback.flac')
             logger.warning(f"[mix] Primary mix unhealthy ({health_reason}), running safe fallback chain")
-            fallback_filter = (
-                f"[0:a]"
-                f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
-                f"equalizer=f=100:width_type=o:width=2:g=-3,"
-                f"volume={safe_db(max(0, -diff) - 2)}dB"
-                f"[a0];"
-                f"[1:a]"
-                f"highpass=f=55,lowpass=f=360,"
-                f"volume='{heartbeat_intro_envelope}':eval=frame,"
-                f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
-                f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
-                f"[a1];"
-                f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights=0.45 0.55,"
-                f"alimiter=limit=0.92"
-                f"[a]"
-            )
+            if loop_bed_ready:
+                fallback_filter = (
+                    f"[0:a]"
+                    f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
+                    f"equalizer=f=100:width_type=o:width=2:g=-3,"
+                    f"volume={safe_db(max(0, -diff) - 2)}dB"
+                    f"[a0];"
+                    f"[1:a]"
+                    f"highpass=f=55,lowpass=f=360,"
+                    f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
+                    f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
+                    f"[a1];"
+                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights=0.45 0.55,"
+                    f"alimiter=limit=0.92"
+                    f"[a]"
+                )
+            else:
+                fallback_filter = (
+                    f"[0:a]"
+                    f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
+                    f"equalizer=f=100:width_type=o:width=2:g=-3,"
+                    f"volume={safe_db(max(0, -diff) - 2)}dB"
+                    f"[a0];"
+                    f"[1:a]"
+                    f"highpass=f=55,lowpass=f=360,"
+                    f"volume='{heartbeat_intro_envelope}':eval=frame,"
+                    f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
+                    f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
+                    f"[a1];"
+                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights=0.45 0.55,"
+                    f"alimiter=limit=0.92"
+                    f"[a]"
+                )
+            fallback_input_flag = picked_mix_input_flag if loop_bed_ready else f'-stream_loop -1 -i "{normalized_picked_path}"'
             fallback_ok = run_ffmpeg(
-                f'ffmpeg -y -i "{normalized_asset_path}" -stream_loop -1 -i "{normalized_picked_path}" '
+                f'ffmpeg -y -i "{normalized_asset_path}" {fallback_input_flag} '
                 f'-filter_complex "{fallback_filter}" -map "[a]" '
                 f'-c:a flac -compression_level 5 "{fallback_mixed_path}"'
             )
