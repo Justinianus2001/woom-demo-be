@@ -226,6 +226,20 @@ def is_generated_mix_track_name(track_name: str) -> bool:
     )
 
 
+def is_ghost_heartbeat_track(track_name: str, display_name: str) -> bool:
+    """Filter legacy placeholder heartbeat entries that should not be exposed to users."""
+    normalized_track = os.path.basename(str(track_name or "")).strip().lower()
+    normalized_display = os.path.basename(str(display_name or "")).strip().lower()
+
+    if normalized_display == "hb.wav":
+        return True
+
+    if normalized_track.endswith("_hb.wav") and normalized_display in {"hb.wav", "hb"}:
+        return True
+
+    return False
+
+
 def normalize_file_type(file_type: str, fallback_track_name: str = "") -> str:
     """Normalize file_type values so frontend can separate heartbeat and trackbeat reliably."""
     lowered = str(file_type or "").strip().lower()
@@ -383,7 +397,11 @@ def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> D
 
 
 def list_tracks_from_r2() -> List[Dict[str, str]]:
-    """List supported audio files from Cloudflare R2 bucket (S3 API)."""
+    """List supported audio files from Cloudflare R2 bucket (S3 API).
+    
+    Validates that each file actually exists before including it in the response
+    to filter out ghost/stale entries.
+    """
     if not is_r2_s3_ready():
         logger.warning("R2 S3 listing is not ready. Missing config or boto3 package.")
         return []
@@ -412,9 +430,22 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
                     if is_generated_mix_track_name(key_name):
                         continue
 
+                    # Validate that file actually exists before including it
+                    try:
+                        s3_client.head_object(Bucket=R2_S3_BUCKET, Key=raw_key)
+                    except ClientError as e:
+                        if e.response.get("Error", {}).get("Code") == "404" or e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
+                            logger.warning(f"Skipping ghost file (not found): {key_name}")
+                            continue
+                        # For other errors, still try to include the file
+                        logger.warning(f"Could not validate file existence for {key_name}: {e}")
+
                     resolved_meta = resolve_track_meta_from_r2(s3_client, raw_key, key_name)
                     display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
                     if is_generated_mix_track_name(display_name):
+                        continue
+                    if normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name) == 'heartbeat' and is_ghost_heartbeat_track(key_name, display_name):
+                        logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
                         continue
 
                     identity_key = (
