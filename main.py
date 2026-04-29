@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import re
+import time
 from functools import lru_cache
 from typing import List, Dict
 # v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
@@ -359,6 +360,30 @@ def upload_track_file_to_r2(
     return object_name
 
 
+def resolve_track_meta_from_head(head_data: dict, object_key: str, track_name: str) -> Dict[str, str]:
+    """Resolve file_type and display_name from a pre-fetched head_object response."""
+    fallback_type = guess_track_file_type(track_name)
+    fallback_display = derive_display_name_from_key(object_key, track_name)
+
+    metadata = head_data.get("Metadata") or {}
+
+    metadata_type = metadata.get("file_type") or metadata.get("filetype") or ""
+    resolved_type = normalize_file_type(metadata_type, fallback_track_name=track_name)
+
+    metadata_name = (
+        metadata.get("display_name")
+        or metadata.get("original_name")
+        or metadata.get("originalname")
+        or ""
+    )
+    resolved_display = str(metadata_name).strip() or fallback_display
+
+    return {
+        "file_type": resolved_type,
+        "display_name": resolved_display,
+    }
+
+
 def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> Dict[str, str]:
     """Resolve file_type and display_name from object metadata with robust fallbacks."""
     fallback_type = guess_track_file_type(track_name)
@@ -366,23 +391,7 @@ def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> D
 
     try:
         head_data = s3_client.head_object(Bucket=R2_S3_BUCKET, Key=object_key)
-        metadata = head_data.get("Metadata") or {}
-
-        metadata_type = metadata.get("file_type") or metadata.get("filetype") or ""
-        resolved_type = normalize_file_type(metadata_type, fallback_track_name=track_name)
-
-        metadata_name = (
-            metadata.get("display_name")
-            or metadata.get("original_name")
-            or metadata.get("originalname")
-            or ""
-        )
-        resolved_display = str(metadata_name).strip() or fallback_display
-
-        return {
-            "file_type": resolved_type,
-            "display_name": resolved_display,
-        }
+        return resolve_track_meta_from_head(head_data, object_key, track_name)
     except ClientError as e:
         logger.warning(f"Cannot read metadata for '{object_key}', fallback to derived values. error={e}")
     except BotoCoreError as e:
@@ -396,12 +405,36 @@ def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> D
     }
 
 
+# ---------------------------------------------------------------------------
+# TTL cache for /tracks listing — avoids hammering R2 on every request.
+# ---------------------------------------------------------------------------
+_tracks_cache: Dict[str, object] = {"data": None, "expires_at": 0.0}
+TRACKS_CACHE_TTL_SECONDS = 60  # Refresh at most once per minute.
+
+
+def _invalidate_tracks_cache() -> None:
+    """Force next call to list_tracks_from_r2 to re-fetch from R2."""
+    _tracks_cache["expires_at"] = 0.0
+
+
 def list_tracks_from_r2() -> List[Dict[str, str]]:
     """List supported audio files from Cloudflare R2 bucket (S3 API).
-    
-    Validates that each file actually exists before including it in the response
-    to filter out ghost/stale entries.
+
+    Performance notes
+    -----------------
+    * Results are cached in-process for TRACKS_CACHE_TTL_SECONDS (60 s) so that
+      rapid successive calls (e.g. frontend polling) do not hammer R2.
+    * A **single** head_object call per file is made to obtain metadata;
+      the separate existence-validation head_object that was here before has
+      been removed because list_objects_v2 already guarantees the key exists.
     """
+    # --- serve from cache when still fresh ---
+    now = time.monotonic()
+    if _tracks_cache["data"] is not None and now < _tracks_cache["expires_at"]:
+        logger.debug("Returning tracks from in-process cache (TTL %.0fs remaining)",
+                     _tracks_cache["expires_at"] - now)
+        return _tracks_cache["data"]  # type: ignore[return-value]
+
     if not is_r2_s3_ready():
         logger.warning("R2 S3 listing is not ready. Missing config or boto3 package.")
         return []
@@ -426,47 +459,61 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
                 if not key_name:
                     continue
                 ext = os.path.splitext(key_name)[1].lower()
-                if ext in ALLOWED_TRACK_EXTENSIONS:
-                    if is_generated_mix_track_name(key_name):
+                if ext not in ALLOWED_TRACK_EXTENSIONS:
+                    continue
+                if is_generated_mix_track_name(key_name):
+                    continue
+
+                # Single head_object call: fetches metadata AND implicitly
+                # confirms existence (list_objects_v2 already proves it exists,
+                # but we still need metadata).  Previously there were TWO
+                # head_object calls per file (one for validation, one inside
+                # resolve_track_meta_from_r2) — that was the main perf culprit.
+                try:
+                    head_data = s3_client.head_object(Bucket=R2_S3_BUCKET, Key=raw_key)
+                except ClientError as e:
+                    code = e.response.get("Error", {}).get("Code") or ""
+                    http_status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+                    if code == "404" or http_status == 404:
+                        logger.warning("Skipping ghost file (not found via head): %s", key_name)
                         continue
+                    logger.warning("head_object failed for %s, using fallback metadata: %s", key_name, e)
+                    head_data = {}
+                except (BotoCoreError, Exception) as e:
+                    logger.warning("head_object unexpected error for %s, using fallback metadata: %s", key_name, e)
+                    head_data = {}
 
-                    # Validate that file actually exists before including it
-                    try:
-                        s3_client.head_object(Bucket=R2_S3_BUCKET, Key=raw_key)
-                    except ClientError as e:
-                        if e.response.get("Error", {}).get("Code") == "404" or e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
-                            logger.warning(f"Skipping ghost file (not found): {key_name}")
-                            continue
-                        # For other errors, still try to include the file
-                        logger.warning(f"Could not validate file existence for {key_name}: {e}")
+                resolved_meta = resolve_track_meta_from_head(head_data, raw_key, key_name)
+                display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
 
-                    resolved_meta = resolve_track_meta_from_r2(s3_client, raw_key, key_name)
-                    display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
-                    if is_generated_mix_track_name(display_name):
-                        continue
-                    if normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name) == 'heartbeat' and is_ghost_heartbeat_track(key_name, display_name):
-                        logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
-                        continue
+                if is_generated_mix_track_name(display_name):
+                    continue
+                if (
+                    normalize_file_type(resolved_meta.get("file_type", ""), fallback_track_name=key_name) == "heartbeat"
+                    and is_ghost_heartbeat_track(key_name, display_name)
+                ):
+                    logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
+                    continue
 
-                    identity_key = (
-                        f"{normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name)}"
-                        f"::{display_name.lower()}"
-                    )
-                    candidate = {
-                        "track_name": key_name,
-                        "file_type": resolved_meta["file_type"],
-                        "display_name": display_name,
-                        "_last_modified": item.get("LastModified"),
-                    }
+                identity_key = (
+                    f"{normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name)}"
+                    f"::{display_name.lower()}"
+                )
+                candidate = {
+                    "track_name": key_name,
+                    "file_type": resolved_meta["file_type"],
+                    "display_name": display_name,
+                    "_last_modified": item.get("LastModified"),
+                }
 
-                    existing = tracks_by_identity.get(identity_key)
-                    if existing is None:
+                existing = tracks_by_identity.get(identity_key)
+                if existing is None:
+                    tracks_by_identity[identity_key] = candidate
+                else:
+                    existing_last = existing.get("_last_modified")
+                    candidate_last = candidate.get("_last_modified")
+                    if candidate_last and (not existing_last or candidate_last > existing_last):
                         tracks_by_identity[identity_key] = candidate
-                    else:
-                        existing_last = existing.get("_last_modified")
-                        candidate_last = candidate.get("_last_modified")
-                        if candidate_last and (not existing_last or candidate_last > existing_last):
-                            tracks_by_identity[identity_key] = candidate
 
             if not response.get("IsTruncated"):
                 break
@@ -484,17 +531,21 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
         logger.error(f"Unexpected error while listing R2 tracks: {e}")
         return []
 
-    tracks = []
-    for item in tracks_by_identity.values():
-        tracks.append(
-            {
-                "track_name": str(item.get("track_name") or ""),
-                "file_type": str(item.get("file_type") or "trackbeat"),
-                "display_name": str(item.get("display_name") or item.get("track_name") or ""),
-            }
-        )
+    tracks = [
+        {
+            "track_name": str(item.get("track_name") or ""),
+            "file_type": str(item.get("file_type") or "trackbeat"),
+            "display_name": str(item.get("display_name") or item.get("track_name") or ""),
+        }
+        for item in tracks_by_identity.values()
+    ]
+    tracks.sort(key=lambda t: t["display_name"].lower())
 
-    tracks.sort(key=lambda item: item["display_name"].lower())
+    # --- store in cache ---
+    _tracks_cache["data"] = tracks
+    _tracks_cache["expires_at"] = time.monotonic() + TRACKS_CACHE_TTL_SECONDS
+    logger.info("Tracks cache refreshed: %d tracks, TTL=%ds", len(tracks), TRACKS_CACHE_TTL_SECONDS)
+
     return tracks
 
 
