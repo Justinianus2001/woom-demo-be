@@ -14,6 +14,7 @@ import urllib.request
 import urllib.error
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import List, Dict
 # v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
@@ -409,7 +410,8 @@ def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> D
 # TTL cache for /tracks listing — avoids hammering R2 on every request.
 # ---------------------------------------------------------------------------
 _tracks_cache: Dict[str, object] = {"data": None, "expires_at": 0.0}
-TRACKS_CACHE_TTL_SECONDS = 60  # Refresh at most once per minute.
+TRACKS_CACHE_TTL_SECONDS = 60   # Refresh at most once per minute.
+HEAD_OBJECT_WORKERS = 10        # Parallel head_object threads per listing call.
 
 
 def _invalidate_tracks_cache() -> None:
@@ -417,22 +419,75 @@ def _invalidate_tracks_cache() -> None:
     _tracks_cache["expires_at"] = 0.0
 
 
+def _fetch_track_candidate(
+    s3_client,
+    raw_key: str,
+    last_modified,
+) -> Dict | None:
+    """Fetch head_object for one key and return a track candidate dict or None.
+
+    Designed to run inside a ThreadPoolExecutor worker — boto3 S3 clients are
+    thread-safe so no locking is required.
+    """
+    key_name = os.path.basename(raw_key)
+
+    try:
+        head_data = s3_client.head_object(Bucket=R2_S3_BUCKET, Key=raw_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code") or ""
+        http_status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+        if code == "404" or http_status == 404:
+            logger.warning("Skipping ghost file (not found via head): %s", key_name)
+            return None
+        logger.warning("head_object failed for %s, using fallback metadata: %s", key_name, exc)
+        head_data = {}
+    except (BotoCoreError, Exception) as exc:
+        logger.warning("head_object unexpected error for %s, using fallback metadata: %s", key_name, exc)
+        head_data = {}
+
+    resolved_meta = resolve_track_meta_from_head(head_data, raw_key, key_name)
+    display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
+
+    if is_generated_mix_track_name(display_name):
+        return None
+    if (
+        normalize_file_type(resolved_meta.get("file_type", ""), fallback_track_name=key_name) == "heartbeat"
+        and is_ghost_heartbeat_track(key_name, display_name)
+    ):
+        logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
+        return None
+
+    return {
+        "track_name": key_name,
+        "file_type": resolved_meta["file_type"],
+        "display_name": display_name,
+        "_last_modified": last_modified,
+        "_raw_key": raw_key,
+    }
+
+
 def list_tracks_from_r2() -> List[Dict[str, str]]:
     """List supported audio files from Cloudflare R2 bucket (S3 API).
 
     Performance notes
     -----------------
-    * Results are cached in-process for TRACKS_CACHE_TTL_SECONDS (60 s) so that
-      rapid successive calls (e.g. frontend polling) do not hammer R2.
-    * A **single** head_object call per file is made to obtain metadata;
-      the separate existence-validation head_object that was here before has
-      been removed because list_objects_v2 already guarantees the key exists.
+    * **TTL cache**: results are cached in-process for TRACKS_CACHE_TTL_SECONDS
+      (60 s).  Repeated calls within that window cost 0 network round-trips.
+    * **2-phase parallel fetch**:
+      - Phase 1  — one ``list_objects_v2`` call collects all eligible object keys
+        (sequential, typically <300 ms).
+      - Phase 2  — ``head_object`` is dispatched for every key in parallel via
+        ``ThreadPoolExecutor`` (HEAD_OBJECT_WORKERS threads).  Total latency is
+        now the latency of the *slowest* single head_object, not the *sum* of all.
+        e.g. 10 tracks × 700 ms sequentially ≈ 7 s  →  ~700 ms in parallel.
     """
     # --- serve from cache when still fresh ---
     now = time.monotonic()
     if _tracks_cache["data"] is not None and now < _tracks_cache["expires_at"]:
-        logger.debug("Returning tracks from in-process cache (TTL %.0fs remaining)",
-                     _tracks_cache["expires_at"] - now)
+        logger.debug(
+            "Returning tracks from in-process cache (TTL %.0fs remaining)",
+            _tracks_cache["expires_at"] - now,
+        )
         return _tracks_cache["data"]  # type: ignore[return-value]
 
     if not is_r2_s3_ready():
@@ -443,12 +498,17 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
     if s3_client is None:
         return []
 
-    tracks_by_identity: Dict[str, Dict[str, object]] = {}
+    # ------------------------------------------------------------------
+    # Phase 1: collect all eligible (key, last_modified) pairs via
+    # list_objects_v2.  This is inherently sequential but cheap — it is
+    # a single paginated API call that returns only key names & sizes.
+    # ------------------------------------------------------------------
+    eligible: List[tuple] = []   # list of (raw_key, last_modified)
     continuation_token = None
 
     try:
         while True:
-            params = {"Bucket": R2_S3_BUCKET, "MaxKeys": 1000}
+            params: Dict = {"Bucket": R2_S3_BUCKET, "MaxKeys": 1000}
             if continuation_token:
                 params["ContinuationToken"] = continuation_token
 
@@ -463,73 +523,79 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
                     continue
                 if is_generated_mix_track_name(key_name):
                     continue
-
-                # Single head_object call: fetches metadata AND implicitly
-                # confirms existence (list_objects_v2 already proves it exists,
-                # but we still need metadata).  Previously there were TWO
-                # head_object calls per file (one for validation, one inside
-                # resolve_track_meta_from_r2) — that was the main perf culprit.
-                try:
-                    head_data = s3_client.head_object(Bucket=R2_S3_BUCKET, Key=raw_key)
-                except ClientError as e:
-                    code = e.response.get("Error", {}).get("Code") or ""
-                    http_status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
-                    if code == "404" or http_status == 404:
-                        logger.warning("Skipping ghost file (not found via head): %s", key_name)
-                        continue
-                    logger.warning("head_object failed for %s, using fallback metadata: %s", key_name, e)
-                    head_data = {}
-                except (BotoCoreError, Exception) as e:
-                    logger.warning("head_object unexpected error for %s, using fallback metadata: %s", key_name, e)
-                    head_data = {}
-
-                resolved_meta = resolve_track_meta_from_head(head_data, raw_key, key_name)
-                display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
-
-                if is_generated_mix_track_name(display_name):
-                    continue
-                if (
-                    normalize_file_type(resolved_meta.get("file_type", ""), fallback_track_name=key_name) == "heartbeat"
-                    and is_ghost_heartbeat_track(key_name, display_name)
-                ):
-                    logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
-                    continue
-
-                identity_key = (
-                    f"{normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name)}"
-                    f"::{display_name.lower()}"
-                )
-                candidate = {
-                    "track_name": key_name,
-                    "file_type": resolved_meta["file_type"],
-                    "display_name": display_name,
-                    "_last_modified": item.get("LastModified"),
-                }
-
-                existing = tracks_by_identity.get(identity_key)
-                if existing is None:
-                    tracks_by_identity[identity_key] = candidate
-                else:
-                    existing_last = existing.get("_last_modified")
-                    candidate_last = candidate.get("_last_modified")
-                    if candidate_last and (not existing_last or candidate_last > existing_last):
-                        tracks_by_identity[identity_key] = candidate
+                eligible.append((raw_key, item.get("LastModified")))
 
             if not response.get("IsTruncated"):
                 break
-
             continuation_token = response.get("NextContinuationToken")
             if not continuation_token:
                 break
     except ClientError as e:
-        logger.error(f"R2 S3 list_objects_v2 failed: {e}")
+        logger.error("R2 S3 list_objects_v2 failed: %s", e)
         return []
     except BotoCoreError as e:
-        logger.error(f"R2 S3 list failed due to botocore error: {e}")
+        logger.error("R2 S3 list failed due to botocore error: %s", e)
         return []
     except Exception as e:
-        logger.error(f"Unexpected error while listing R2 tracks: {e}")
+        logger.error("Unexpected error while listing R2 tracks: %s", e)
         return []
+
+    if not eligible:
+        return []
+
+    # ------------------------------------------------------------------
+    # Phase 2: fire head_object for all eligible keys IN PARALLEL.
+    # boto3 S3 clients are documented as thread-safe, so we can share
+    # the same client across workers without a lock.
+    # ------------------------------------------------------------------
+    logger.info(
+        "Fetching metadata for %d eligible tracks with %d workers …",
+        len(eligible),
+        min(HEAD_OBJECT_WORKERS, len(eligible)),
+    )
+    t0 = time.monotonic()
+
+    candidates: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=min(HEAD_OBJECT_WORKERS, len(eligible))) as pool:
+        futures = {
+            pool.submit(_fetch_track_candidate, s3_client, raw_key, last_modified): raw_key
+            for raw_key, last_modified in eligible
+        }
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.warning("Unexpected error in head_object worker for %s: %s", futures[future], exc)
+                result = None
+            if result is not None:
+                candidates.append(result)
+
+    logger.info(
+        "Parallel head_object phase done: %d/%d tracks OK in %.2fs",
+        len(candidates),
+        len(eligible),
+        time.monotonic() - t0,
+    )
+
+    # ------------------------------------------------------------------
+    # Deduplicate: same (file_type, display_name) → keep newest upload.
+    # ------------------------------------------------------------------
+    tracks_by_identity: Dict[str, Dict] = {}
+    for candidate in candidates:
+        key_name = candidate["track_name"]
+        display_name = candidate["display_name"]
+        identity_key = (
+            f"{normalize_file_type(candidate.get('file_type', ''), fallback_track_name=key_name)}"
+            f"::{display_name.lower()}"
+        )
+        existing = tracks_by_identity.get(identity_key)
+        if existing is None:
+            tracks_by_identity[identity_key] = candidate
+        else:
+            existing_last = existing.get("_last_modified")
+            candidate_last = candidate.get("_last_modified")
+            if candidate_last and (not existing_last or candidate_last > existing_last):
+                tracks_by_identity[identity_key] = candidate
 
     tracks = [
         {
