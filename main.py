@@ -16,7 +16,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from typing import List, Dict
+from typing import List, Dict, Optional
 # v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
 from processor import mix_audio_v1, adjust_bpm, preprocess_shared
 
@@ -423,7 +423,7 @@ def _fetch_track_candidate(
     s3_client,
     raw_key: str,
     last_modified,
-) -> Dict | None:
+) -> Optional[Dict]:
     """Fetch head_object for one key and return a track candidate dict or None.
 
     Designed to run inside a ThreadPoolExecutor worker — boto3 S3 clients are
