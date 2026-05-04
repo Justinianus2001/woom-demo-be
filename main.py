@@ -13,8 +13,10 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import re
+import time
 from functools import lru_cache
-from typing import List, Dict
+from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
 from processor import mix_audio_v1, adjust_bpm, preprocess_shared
 
@@ -396,12 +398,135 @@ def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> D
     }
 
 
+# ---------------------------------------------------------------------------
+
+
+def resolve_track_meta_from_head(head_data: dict, object_key: str, track_name: str) -> Dict[str, str]:
+    """Resolve file_type and display_name from a pre-fetched head_object response."""
+    fallback_type = guess_track_file_type(track_name)
+    fallback_display = derive_display_name_from_key(object_key, track_name)
+
+    if not head_data:
+        return {"file_type": fallback_type, "display_name": fallback_display}
+
+    try:
+        metadata = head_data.get("Metadata") or {}
+        metadata_type = metadata.get("file_type") or metadata.get("filetype") or ""
+        resolved_type = normalize_file_type(metadata_type, fallback_track_name=track_name)
+
+        metadata_name = (
+            metadata.get("display_name")
+            or metadata.get("original_name")
+            or metadata.get("originalname")
+            or ""
+        )
+        resolved_display = str(metadata_name).strip() or fallback_display
+
+        return {
+            "file_type": resolved_type,
+            "display_name": resolved_display,
+        }
+    except Exception as exc:
+        logger.warning("Failed to parse head_data for %s, using fallbacks: %s", track_name, exc)
+        return {"file_type": fallback_type, "display_name": fallback_display}
+# TTL cache for /tracks listing — avoids hammering R2 on every request.
+# ---------------------------------------------------------------------------
+_tracks_cache: Dict[str, object] = {"data": None, "expires_at": 0.0}
+TRACKS_CACHE_TTL_SECONDS = 60   # Refresh at most once per minute.
+HEAD_OBJECT_WORKERS = 10        # Parallel head_object threads per listing call.
+
+
+def _invalidate_tracks_cache() -> None:
+    """Force next call to list_tracks_from_r2 to re-fetch from R2."""
+    _tracks_cache["expires_at"] = 0.0
+
+
+def _fetch_track_candidate(
+    s3_client,
+    raw_key: str,
+    last_modified,
+) -> Optional[Dict]:
+    """Fetch head_object for one key and return a track candidate dict or None.
+
+    Designed to run inside a ThreadPoolExecutor worker — boto3 S3 clients are
+    thread-safe so no locking is required.
+    """
+    key_name = os.path.basename(raw_key)
+
+    try:
+        head_data = s3_client.head_object(Bucket=R2_S3_BUCKET, Key=raw_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code") or ""
+        http_status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+        if code == "404" or http_status == 404:
+            logger.warning("Skipping ghost file (not found via head): %s", key_name)
+            return None
+        logger.warning("head_object failed for %s, using fallback metadata: %s", key_name, exc)
+        head_data = {}
+    except (BotoCoreError, Exception) as exc:
+        logger.warning("head_object unexpected error for %s, using fallback metadata: %s", key_name, exc)
+        head_data = {}
+
+    resolved_meta = resolve_track_meta_from_head(head_data, raw_key, key_name)  # Sử dụng head_data from head_object
+    display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
+
+    if is_generated_mix_track_name(display_name):
+        return None
+    if (
+        normalize_file_type(resolved_meta.get("file_type", ""), fallback_track_name=key_name) == "heartbeat"
+        and is_ghost_heartbeat_track(key_name, display_name)
+    ):
+        logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
+        return None
+
+    # Extract file size from head_object response (Content-Length in bytes)
+    content_length = 0
+    try:
+        if head_data and "ContentLength" in head_data:
+            content_length = int(head_data["ContentLength"] or 0)
+        elif head_data and "ResponseMetadata" in head_data:
+            # Fallback to HTTP header
+            http_headers = head_data["ResponseMetadata"].get("HTTPHeaders") or {}
+            if "content-length" in http_headers:
+                content_length = int(http_headers["content-length"] or 0)
+    except (ValueError, TypeError, KeyError) as e:
+        logger.warning("Failed to extract Content-Length for %s: %s", key_name, e)
+        content_length = 0
+
+    return {
+        "track_name": key_name,
+        "file_type": resolved_meta["file_type"],
+        "display_name": display_name,
+        "size_bytes": content_length,  # Added for metadata endpoint
+        "_last_modified": last_modified,
+        "_raw_key": raw_key,
+    }
+
+
 def list_tracks_from_r2() -> List[Dict[str, str]]:
     """List supported audio files from Cloudflare R2 bucket (S3 API).
-    
-    Validates that each file actually exists before including it in the response
-    to filter out ghost/stale entries.
+
+    Performance notes
+    -----------------
+    * **TTL cache**: results are cached in-process for TRACKS_CACHE_TTL_SECONDS
+      (60 s).  Repeated calls within that window cost 0 network round-trips.
+    * **2-phase parallel fetch**:
+      - Phase 1  — one ``list_objects_v2`` call collects all eligible key names
+        (sequential, typically <300 ms).
+      - Phase 2  — ``head_object`` is dispatched for every key in parallel via
+        ``ThreadPoolExecutor`` (HEAD_OBJECT_WORKERS threads).  Total latency is
+        now the latency of the *slowest* single head_object, not the *sum* of all.
+        e.g. 10 tracks × 700 ms sequentially ≈ 7 s  →  ~700 ms in parallel.
     """
+    # --- serve from cache when still fresh ---
+    now = time.monotonic()
+    if _tracks_cache["data"] is not None and now < _tracks_cache["expires_at"]:
+        logger.debug(
+            "Returning tracks from in-process cache (TTL %.0fs remaining)",
+            _tracks_cache["expires_at"] - now,
+        )
+        return _tracks_cache["data"]  # type: ignore[return-value]
+
     if not is_r2_s3_ready():
         logger.warning("R2 S3 listing is not ready. Missing config or boto3 package.")
         return []
@@ -410,12 +535,17 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
     if s3_client is None:
         return []
 
-    tracks_by_identity: Dict[str, Dict[str, object]] = {}
+    # ------------------------------------------------------------------
+    # Phase 1: collect all eligible (key, last_modified) pairs via
+    # list_objects_v2.  This is inherently sequential but cheap — it is
+    # a single paginated API call that returns only key names & sizes.
+    # ------------------------------------------------------------------
+    eligible: List[tuple] = []   # list of (raw_key, last_modified)
     continuation_token = None
 
     try:
         while True:
-            params = {"Bucket": R2_S3_BUCKET, "MaxKeys": 1000}
+            params: Dict = {"Bucket": R2_S3_BUCKET, "MaxKeys": 1000}
             if continuation_token:
                 params["ContinuationToken"] = continuation_token
 
@@ -426,75 +556,100 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
                 if not key_name:
                     continue
                 ext = os.path.splitext(key_name)[1].lower()
-                if ext in ALLOWED_TRACK_EXTENSIONS:
-                    if is_generated_mix_track_name(key_name):
-                        continue
-
-                    # Validate that file actually exists before including it
-                    try:
-                        s3_client.head_object(Bucket=R2_S3_BUCKET, Key=raw_key)
-                    except ClientError as e:
-                        if e.response.get("Error", {}).get("Code") == "404" or e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
-                            logger.warning(f"Skipping ghost file (not found): {key_name}")
-                            continue
-                        # For other errors, still try to include the file
-                        logger.warning(f"Could not validate file existence for {key_name}: {e}")
-
-                    resolved_meta = resolve_track_meta_from_r2(s3_client, raw_key, key_name)
-                    display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
-                    if is_generated_mix_track_name(display_name):
-                        continue
-                    if normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name) == 'heartbeat' and is_ghost_heartbeat_track(key_name, display_name):
-                        logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
-                        continue
-
-                    identity_key = (
-                        f"{normalize_file_type(resolved_meta.get('file_type', ''), fallback_track_name=key_name)}"
-                        f"::{display_name.lower()}"
-                    )
-                    candidate = {
-                        "track_name": key_name,
-                        "file_type": resolved_meta["file_type"],
-                        "display_name": display_name,
-                        "_last_modified": item.get("LastModified"),
-                    }
-
-                    existing = tracks_by_identity.get(identity_key)
-                    if existing is None:
-                        tracks_by_identity[identity_key] = candidate
-                    else:
-                        existing_last = existing.get("_last_modified")
-                        candidate_last = candidate.get("_last_modified")
-                        if candidate_last and (not existing_last or candidate_last > existing_last):
-                            tracks_by_identity[identity_key] = candidate
+                if ext not in ALLOWED_TRACK_EXTENSIONS:
+                    continue
+                if is_generated_mix_track_name(key_name):
+                    continue
+                eligible.append((raw_key, item.get("LastModified")))
 
             if not response.get("IsTruncated"):
                 break
-
             continuation_token = response.get("NextContinuationToken")
             if not continuation_token:
                 break
     except ClientError as e:
-        logger.error(f"R2 S3 list_objects_v2 failed: {e}")
+        logger.error("R2 S3 list_objects_v2 failed: %s", e)
         return []
     except BotoCoreError as e:
-        logger.error(f"R2 S3 list failed due to botocore error: {e}")
+        logger.error("R2 S3 list failed due to botocore error: %s", e)
         return []
     except Exception as e:
-        logger.error(f"Unexpected error while listing R2 tracks: {e}")
+        logger.error("Unexpected error while listing R2 tracks: %s", e)
         return []
 
-    tracks = []
-    for item in tracks_by_identity.values():
-        tracks.append(
-            {
-                "track_name": str(item.get("track_name") or ""),
-                "file_type": str(item.get("file_type") or "trackbeat"),
-                "display_name": str(item.get("display_name") or item.get("track_name") or ""),
-            }
-        )
+    if not eligible:
+        return []
 
-    tracks.sort(key=lambda item: item["display_name"].lower())
+    # ------------------------------------------------------------------
+    # Phase 2: fire head_object for all eligible keys IN PARALLEL.
+    # boto3 S3 clients are documented as thread-safe, so we can share
+    # the same client across workers without a lock.
+    # ------------------------------------------------------------------
+    logger.info(
+        "Fetching metadata for %d eligible tracks with %d workers …",
+        len(eligible),
+        min(HEAD_OBJECT_WORKERS, len(eligible)),
+    )
+    t0 = time.monotonic()
+
+    candidates: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=min(HEAD_OBJECT_WORKERS, len(eligible))) as pool:
+        futures = {
+            pool.submit(_fetch_track_candidate, s3_client, raw_key, last_modified): raw_key
+            for raw_key, last_modified in eligible
+        }
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.warning("Unexpected error in head_object worker for %s: %s", futures[future], exc)
+                result = None
+            if result is not None:
+                candidates.append(result)
+
+    logger.info(
+        "Parallel head_object phase done: %d/%d tracks OK in %.2fs",
+        len(candidates),
+        len(eligible),
+        time.monotonic() - t0,
+    )
+
+    # ------------------------------------------------------------------
+    # Deduplicate: same (file_type, display_name) → keep newest upload.
+    # ------------------------------------------------------------------
+    tracks_by_identity: Dict[str, Dict] = {}
+    for candidate in candidates:
+        key_name = candidate["track_name"]
+        display_name = candidate["display_name"]
+        identity_key = (
+            f"{normalize_file_type(candidate.get('file_type', ''), fallback_track_name=key_name)}"
+            f"::{display_name.lower()}"
+        )
+        existing = tracks_by_identity.get(identity_key)
+        if existing is None:
+            tracks_by_identity[identity_key] = candidate
+        else:
+            existing_last = existing.get("_last_modified")
+            candidate_last = candidate.get("_last_modified")
+            if candidate_last and (not existing_last or candidate_last > existing_last):
+                tracks_by_identity[identity_key] = candidate
+
+    tracks = [
+        {
+            "track_name": str(item.get("track_name") or ""),
+            "file_type": str(item.get("file_type") or "trackbeat"),
+            "display_name": str(item.get("display_name") or item.get("track_name") or ""),
+            "size_bytes": int(item.get("size_bytes") or 0),
+        }
+        for item in tracks_by_identity.values()
+    ]
+    tracks.sort(key=lambda t: t["display_name"].lower())
+
+    # --- store in cache ---
+    _tracks_cache["data"] = tracks
+    _tracks_cache["expires_at"] = time.monotonic() + TRACKS_CACHE_TTL_SECONDS
+    logger.info("Tracks cache refreshed: %d tracks, TTL=%ds", len(tracks), TRACKS_CACHE_TTL_SECONDS)
+
     return tracks
 
 
@@ -718,6 +873,43 @@ def generate_mix_results(
 
         logger.error(f"[{endpoint_name}] Error creating unified v1 output: {e}\n{traceback.format_exc()}")
         yield emit(7, "failed", "Mixing failed due to server error.", error=str(e))
+
+
+@app.get("/tracks/metadata")
+def list_tracks_metadata():
+    """Return lightweight track metadata (no audio data) for lazyloading.
+
+    Returns JSON with track_name, file_type, display_name, size (formatted),
+    and file_url. This endpoint is optimized for fast initial page load (≤2s).
+    """
+    tracks = list_tracks_from_r2()
+
+    def format_size(bytes_val):
+        """Convert bytes to human-readable format (MB/KB)."""
+        try:
+            b = int(bytes_val or 0)
+        except (ValueError, TypeError):
+            return "0B"
+        if b >= 1024 * 1024:
+            return f"{b / (1024 * 1024):.1f}MB"
+        elif b >= 1024:
+            return f"{b / 1024:.1f}KB"
+        else:
+            return f"{b}B"
+
+    payload = [
+        {
+            "track_name": item["track_name"],
+            "file_type": normalize_file_type(item.get("file_type", ""), fallback_track_name=item["track_name"]),
+            "display_name": item.get("display_name") or item["track_name"],
+            "size": format_size(item.get("size_bytes", 0)),
+            "file_url": build_r2_track_url(item["track_name"]),
+        }
+        for item in tracks
+    ]
+
+    logger.info(f"Returning metadata for {len(payload)} tracks (lightweight)")
+    return {"tracks": payload}
 
 
 @app.get("/tracks")
