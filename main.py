@@ -14,9 +14,9 @@ import urllib.request
 import urllib.error
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # v2/v3 remain in processor.py for rollback, but the API now exposes only the unified v1 pipeline.
 from processor import mix_audio_v1, adjust_bpm, preprocess_shared
 
@@ -361,30 +361,6 @@ def upload_track_file_to_r2(
     return object_name
 
 
-def resolve_track_meta_from_head(head_data: dict, object_key: str, track_name: str) -> Dict[str, str]:
-    """Resolve file_type and display_name from a pre-fetched head_object response."""
-    fallback_type = guess_track_file_type(track_name)
-    fallback_display = derive_display_name_from_key(object_key, track_name)
-
-    metadata = head_data.get("Metadata") or {}
-
-    metadata_type = metadata.get("file_type") or metadata.get("filetype") or ""
-    resolved_type = normalize_file_type(metadata_type, fallback_track_name=track_name)
-
-    metadata_name = (
-        metadata.get("display_name")
-        or metadata.get("original_name")
-        or metadata.get("originalname")
-        or ""
-    )
-    resolved_display = str(metadata_name).strip() or fallback_display
-
-    return {
-        "file_type": resolved_type,
-        "display_name": resolved_display,
-    }
-
-
 def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> Dict[str, str]:
     """Resolve file_type and display_name from object metadata with robust fallbacks."""
     fallback_type = guess_track_file_type(track_name)
@@ -392,7 +368,23 @@ def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> D
 
     try:
         head_data = s3_client.head_object(Bucket=R2_S3_BUCKET, Key=object_key)
-        return resolve_track_meta_from_head(head_data, object_key, track_name)
+        metadata = head_data.get("Metadata") or {}
+
+        metadata_type = metadata.get("file_type") or metadata.get("filetype") or ""
+        resolved_type = normalize_file_type(metadata_type, fallback_track_name=track_name)
+
+        metadata_name = (
+            metadata.get("display_name")
+            or metadata.get("original_name")
+            or metadata.get("originalname")
+            or ""
+        )
+        resolved_display = str(metadata_name).strip() or fallback_display
+
+        return {
+            "file_type": resolved_type,
+            "display_name": resolved_display,
+        }
     except ClientError as e:
         logger.warning(f"Cannot read metadata for '{object_key}', fallback to derived values. error={e}")
     except BotoCoreError as e:
@@ -407,6 +399,36 @@ def resolve_track_meta_from_r2(s3_client, object_key: str, track_name: str) -> D
 
 
 # ---------------------------------------------------------------------------
+
+
+def resolve_track_meta_from_head(head_data: dict, object_key: str, track_name: str) -> Dict[str, str]:
+    """Resolve file_type and display_name from a pre-fetched head_object response."""
+    fallback_type = guess_track_file_type(track_name)
+    fallback_display = derive_display_name_from_key(object_key, track_name)
+
+    if not head_data:
+        return {"file_type": fallback_type, "display_name": fallback_display}
+
+    try:
+        metadata = head_data.get("Metadata") or {}
+        metadata_type = metadata.get("file_type") or metadata.get("filetype") or ""
+        resolved_type = normalize_file_type(metadata_type, fallback_track_name=track_name)
+
+        metadata_name = (
+            metadata.get("display_name")
+            or metadata.get("original_name")
+            or metadata.get("originalname")
+            or ""
+        )
+        resolved_display = str(metadata_name).strip() or fallback_display
+
+        return {
+            "file_type": resolved_type,
+            "display_name": resolved_display,
+        }
+    except Exception as exc:
+        logger.warning("Failed to parse head_data for %s, using fallbacks: %s", track_name, exc)
+        return {"file_type": fallback_type, "display_name": fallback_display}
 # TTL cache for /tracks listing — avoids hammering R2 on every request.
 # ---------------------------------------------------------------------------
 _tracks_cache: Dict[str, object] = {"data": None, "expires_at": 0.0}
@@ -445,7 +467,7 @@ def _fetch_track_candidate(
         logger.warning("head_object unexpected error for %s, using fallback metadata: %s", key_name, exc)
         head_data = {}
 
-    resolved_meta = resolve_track_meta_from_head(head_data, raw_key, key_name)
+    resolved_meta = resolve_track_meta_from_head(head_data, raw_key, key_name)  # Sử dụng head_data from head_object
     display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
 
     if is_generated_mix_track_name(display_name):
@@ -457,10 +479,25 @@ def _fetch_track_candidate(
         logger.warning("Skipping ghost heartbeat entry: key='%s' display='%s'", key_name, display_name)
         return None
 
+    # Extract file size from head_object response (Content-Length in bytes)
+    content_length = 0
+    try:
+        if head_data and "ContentLength" in head_data:
+            content_length = int(head_data["ContentLength"] or 0)
+        elif head_data and "ResponseMetadata" in head_data:
+            # Fallback to HTTP header
+            http_headers = head_data["ResponseMetadata"].get("HTTPHeaders") or {}
+            if "content-length" in http_headers:
+                content_length = int(http_headers["content-length"] or 0)
+    except (ValueError, TypeError, KeyError) as e:
+        logger.warning("Failed to extract Content-Length for %s: %s", key_name, e)
+        content_length = 0
+
     return {
         "track_name": key_name,
         "file_type": resolved_meta["file_type"],
         "display_name": display_name,
+        "size_bytes": content_length,  # Added for metadata endpoint
         "_last_modified": last_modified,
         "_raw_key": raw_key,
     }
@@ -474,7 +511,7 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
     * **TTL cache**: results are cached in-process for TRACKS_CACHE_TTL_SECONDS
       (60 s).  Repeated calls within that window cost 0 network round-trips.
     * **2-phase parallel fetch**:
-      - Phase 1  — one ``list_objects_v2`` call collects all eligible object keys
+      - Phase 1  — one ``list_objects_v2`` call collects all eligible key names
         (sequential, typically <300 ms).
       - Phase 2  — ``head_object`` is dispatched for every key in parallel via
         ``ThreadPoolExecutor`` (HEAD_OBJECT_WORKERS threads).  Total latency is
@@ -602,6 +639,7 @@ def list_tracks_from_r2() -> List[Dict[str, str]]:
             "track_name": str(item.get("track_name") or ""),
             "file_type": str(item.get("file_type") or "trackbeat"),
             "display_name": str(item.get("display_name") or item.get("track_name") or ""),
+            "size_bytes": int(item.get("size_bytes") or 0),
         }
         for item in tracks_by_identity.values()
     ]
@@ -835,6 +873,43 @@ def generate_mix_results(
 
         logger.error(f"[{endpoint_name}] Error creating unified v1 output: {e}\n{traceback.format_exc()}")
         yield emit(7, "failed", "Mixing failed due to server error.", error=str(e))
+
+
+@app.get("/tracks/metadata")
+def list_tracks_metadata():
+    """Return lightweight track metadata (no audio data) for lazyloading.
+
+    Returns JSON with track_name, file_type, display_name, size (formatted),
+    and file_url. This endpoint is optimized for fast initial page load (≤2s).
+    """
+    tracks = list_tracks_from_r2()
+
+    def format_size(bytes_val):
+        """Convert bytes to human-readable format (MB/KB)."""
+        try:
+            b = int(bytes_val or 0)
+        except (ValueError, TypeError):
+            return "0B"
+        if b >= 1024 * 1024:
+            return f"{b / (1024 * 1024):.1f}MB"
+        elif b >= 1024:
+            return f"{b / 1024:.1f}KB"
+        else:
+            return f"{b}B"
+
+    payload = [
+        {
+            "track_name": item["track_name"],
+            "file_type": normalize_file_type(item.get("file_type", ""), fallback_track_name=item["track_name"]),
+            "display_name": item.get("display_name") or item["track_name"],
+            "size": format_size(item.get("size_bytes", 0)),
+            "file_url": build_r2_track_url(item["track_name"]),
+        }
+        for item in tracks
+    ]
+
+    logger.info(f"Returning metadata for {len(payload)} tracks (lightweight)")
+    return {"tracks": payload}
 
 
 @app.get("/tracks")
@@ -1110,4 +1185,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
