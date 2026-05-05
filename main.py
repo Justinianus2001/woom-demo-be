@@ -1490,6 +1490,7 @@ def run_mix_background(task_id: str):
 
         update_mix_task(task_id, progress="4/7", message="Mixing heartbeat with track...")
         from processor import mix_audio_v1
+        logger.info(f"[task {task_id}] Calling mix_audio_v1 with out_path={os.path.abspath(out_path)}, exists_before={os.path.exists(out_path)}")
         mix_audio_v1(
             asset_path, picked_path, out_path,
             heart_duration=heart_duration,
@@ -1497,6 +1498,7 @@ def run_mix_background(task_id: str):
             music_tempo=music_tempo,
             shared_data=shared_data,
         )
+        logger.info(f"[task {task_id}] mix_audio_v1 returned. out_path exists={os.path.exists(out_path)}, size={os.path.getsize(out_path) if os.path.exists(out_path) else 'N/A'}")
 
         update_mix_task(task_id, progress="5/7", message="Validating output...")
         if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):

@@ -1195,12 +1195,20 @@ def tune_to_432hz(input_path, output_path):
     """Pitch shift toàn bộ audio xuống 432Hz tuning từ 440Hz dùng FFmpeg."""
     # asetrate changes pitch and speed, atempo corrects the speed back.
     # 432/440 = 0.981818... and 440/432 = 1.018518...
+    # Pre-calculate asetrate value to avoid potential issues with expressions in some ffmpeg builds
+    asetrate_val = int(44100 * 432 / 440)  # ~43209
     cmd = (
         f'ffmpeg -y -i "{input_path}" '
-        f'-af "asetrate=44100*432/440,aresample=44100,atempo=1.0185185185185186" '
+        f'-af "asetrate={asetrate_val},aresample=44100,atempo=1.0185185185185186" '
         f'{codec_args(output_path)} "{output_path}"'
     )
-    return run_ffmpeg(cmd)
+    logger.info(f"[tune_to_432hz] input={input_path}, output={output_path}, asetrate={asetrate_val}")
+    result = run_ffmpeg(cmd)
+    if result:
+        logger.info(f"[tune_to_432hz] Success: {output_path} (size={os.path.getsize(output_path) if os.path.exists(output_path) else 'N/A'})")
+    else:
+        logger.error(f"[tune_to_432hz] Failed to create: {output_path}")
+    return result
 
 def get_atempo_filter(rate):
     """Helper to generate atempo filter string, chaining if rate is outside [0.5, 100]."""
@@ -1425,6 +1433,11 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         vì aloop=-1 infinite stream → timestamp reset mỗi vòng → afade=t=out không hoạt động)
     8. 432Hz tuning → Output FLAC
     """
+    # Log key paths for debugging "Output file not created" issues
+    output_path = os.path.abspath(output_path)
+    logger.info(f"[mix] === START mix_audio_v1 ===")
+    logger.info(f"[mix] output_path (absolute): {output_path}")
+    logger.info(f"[mix] output_path exists before start: {os.path.exists(output_path)}")
     if heart_tempo is None:
         _, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
     if heart_tempo <= 0:
@@ -1652,6 +1665,14 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f'ffmpeg -y -i "{normalized_asset_path}" -i {picked_mix_input_flag} '
             f'-filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
         )
+        if primary_mix_ok:
+            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
+                logger.info(f"[mix] ✅ mixed_temp_path created: {mixed_temp_path} (size={os.path.getsize(mixed_temp_path)})")
+            else:
+                logger.error(f"[mix] ❌ mixed_temp_path MISSING/EMPTY after successful ffmpeg: {mixed_temp_path}")
+                primary_mix_ok = False
+        else:
+            logger.error(f"[mix] ❌ primary mix filter chain failed")
 
         # If loop bed not ready, need separate fade + 432Hz steps
         if not loop_bed_ready:
@@ -1700,6 +1721,16 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         else:
             # With loop bed ready, fade + 432Hz are already in the filter chain
             logger.info("[mix] ✅ Fade + 432Hz included in optimized filter chain")
+
+        # Nếu loop_bed_ready=True VÀ primary_mix_ok: fade + 432Hz đã nằm trong filter chain
+        if loop_bed_ready and primary_mix_ok:
+            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
+                import shutil
+                shutil.copy2(mixed_temp_path, output_path)
+                logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
+                return
+            else:
+                raise RuntimeError("[mix] loop_bed_ready but mixed_temp_path missing/empty, cannot create output")
 
         if not primary_mix_ok:
             logger.warning("[mix] Primary filter chain failed, retrying with safe fallback mix chain")
@@ -1876,14 +1907,23 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                 f'ffmpeg -y -i "{src_for_432}" {codec_args(output_path)} "{output_path}"'
             ):
                 logger.error("[mix] Final export failed after 432Hz fallback")
-                return
+                raise RuntimeError("[mix] Cannot create output: both 432Hz and fallback failed")
         logger.info(f"[mix] ✅ 432Hz tuning done → {output_path}")
 
  
     except Exception as e:
         logger.error(f"[mix] Error: {e}\n{traceback.format_exc()}")
+        logger.error(f"[mix] output_path exists at exception time: {os.path.exists(output_path)}")
         raise
     finally:
+        logger.info(f"[mix] === END mix_audio_v1 ===")
+        logger.info(f"[mix] output_path (absolute) at finally: {output_path}")
+        logger.info(f"[mix] output_path exists at finally: {os.path.exists(output_path)}")
+        if os.path.exists(output_path):
+            logger.info(f"[mix] output_path size at finally: {os.path.getsize(output_path)} bytes")
+        # Check if output_path is inside temp_dir_obj (should NOT be!)
+        if output_path.startswith(temp_dir_obj.name):
+            logger.error(f"[mix] ⚠️ WARNING: output_path is inside temp_dir_obj! Will be deleted by cleanup!")
         temp_dir_obj.cleanup()
  
 
