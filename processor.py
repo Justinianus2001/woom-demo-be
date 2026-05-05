@@ -301,7 +301,7 @@ BPM_SYNC_APPLY_EPS = 0.02
 AMBIENT_HEARTBEAT_WEIGHT = 0.30
 STANDARD_HEARTBEAT_WEIGHT = 0.55
 AFFTDN_NF_MIN_DB = -80.0
-AFFTDN_NF_MAX_DB = -20.0
+AFFTDN_NF_MAX_DB = -16.0  # Allow -16 for clean files (less aggressive)
 STANDARD_AFFTDN_NF_DB = -20.0
 AMBIENT_AFFTDN_NF_DB = -24.0
 HEARTBEAT_LOOP_CROSSFADE_MS = 120
@@ -309,8 +309,13 @@ HEARTBEAT_LOOP_INTRO_SILENCE_MS = int(HEARTBEAT_SILENT_LEAD_SECONDS * 1000)
 HEARTBEAT_LOOP_INTRO_RAMP_MS = int(HEARTBEAT_VOLUME_RAMP_SECONDS * 1000)
 
 
-def _build_optimized_mix_filter(params: dict) -> str:
+def _build_optimized_mix_filter(params: dict, quality_info: dict = None) -> str:
     """Build optimized FFmpeg filter chain combining mix + fade + 432Hz.
+
+    Adaptive filter chain based on input quality:
+    - Clean: wider bandpass (40-420Hz), lighter compression (ratio=1.3), milder denoise (nf=-16)
+    - Moderate: balanced settings (50-380Hz, ratio=1.4, nf=-18)
+    - Noisy: aggressive settings (60-350Hz, ratio=1.5, nf=-20) - same as original
 
     Only works when loop_bed_ready=True (finite length heartbeat bed).
     This merges:
@@ -326,12 +331,34 @@ def _build_optimized_mix_filter(params: dict) -> str:
             - intro_delay_ms, volume_asset, volume_picked
             - fade_in_s, fade_out_start, fade_out_s
             - bpm_mode, use_loop_bed, heart_len_s, sr
-            - lowpass_f (optional, default 350)
+            - lowpass_f (optional, default based on quality)
             - heart_ramp_end_s, heartbeat_intro_envelope (for aloop case)
+        quality_info: dict from detect_input_quality() (optional)
 
     Returns:
         Filter chain string ready for -filter_complex
     """
+    # Determine filter params based on quality
+    quality = 'moderate'
+    if quality_info:
+        quality = quality_info.get('quality', 'moderate')
+
+    if quality == 'clean':
+        hp_freq = 40
+        lp_freq = 420
+        afftdn_nf = -16
+        comp_ratio = 1.3
+    elif quality == 'noisy':
+        hp_freq = 60
+        lp_freq = params.get('lowpass_f', 350)
+        afftdn_nf = STANDARD_AFFTDN_NF_DB
+        comp_ratio = 1.5
+    else:  # moderate
+        hp_freq = 50
+        lp_freq = params.get('lowpass_f', 380)
+        afftdn_nf = -18
+        comp_ratio = 1.4
+
     # Asset filter
     asset_f = (
         f"[0:a]"
@@ -342,16 +369,15 @@ def _build_optimized_mix_filter(params: dict) -> str:
     )
 
     # Picked filter
-    lowpass_f = params.get('lowpass_f', 350)
     if params.get('use_loop_bed'):
         picked_f = (
             f"[1:a]"
-            f"highpass=f=60,lowpass=f={lowpass_f},"
+            f"highpass=f={hp_freq},lowpass=f={lp_freq},"
             f"bass=g=4:f=80,"
             f"volume={safe_db(params['volume_picked'])},"
-            f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
+            f"acompressor=threshold=-18dB:ratio={comp_ratio}:attack=8:release=100,"
             f"stereowiden=delay=5,"
-            f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f}"
+            f"afftdn=nf={safe_afftdn_nf(afftdn_nf):.1f}"
             f"[a1];"
         )
     else:
@@ -363,13 +389,13 @@ def _build_optimized_mix_filter(params: dict) -> str:
         )
         picked_f = (
             f"[1:a]"
-            f"highpass=f=60,lowpass=f={lowpass_f},"
+            f"highpass=f={hp_freq},lowpass=f={lp_freq},"
             f"bass=g=4:f=80,"
             f"volume='{heartbeat_intro_envelope}':eval=frame,"
             f"volume={safe_db(params['volume_picked'])},"
-            f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
+            f"acompressor=threshold=-18dB:ratio={comp_ratio}:attack=8:release=100,"
             f"stereowiden=delay=5,"
-            f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f},"
+            f"afftdn=nf={safe_afftdn_nf(afftdn_nf):.1f},"
             f"aloop=loop=-1:size={int(params.get('heart_len_s', 10) * params.get('sr', 44100))}"
             f"[a1];"
         )
@@ -1058,10 +1084,103 @@ def adjust_bpm(input_path, output_path, speed_mode):
         # copy through if atempo fails
         run_ffmpeg(f'ffmpeg -y -i "{input_path}"{codec} "{output_path}"')
 
-def apply_noise_reduction(y, sr):
-    """Sử dụng HPSS từ Librosa để tách percussive (nhịp tim)."""
+def apply_noise_reduction(y, sr, denoise_level='auto', quality_info=None):
+    """Adaptive HPSS: blend harmonic + percussive based on file quality.
+
+    Args:
+        y: numpy array audio
+        sr: sample rate
+        denoise_level: 'auto'|'none'|'mild'|'aggressive'
+        quality_info: dict từ detect_input_quality() (optional)
+
+    Returns:
+        numpy array đã xử lý
+    """
     y_harmonic, y_percussive = librosa.effects.hpss(y)
-    return y_percussive
+
+    if denoise_level == 'none':
+        return y
+    elif denoise_level == 'mild':
+        return 0.7 * y_percussive + 0.3 * y_harmonic
+    elif denoise_level == 'aggressive':
+        return y_percussive
+
+    # Auto mode - detect quality
+    if quality_info is None:
+        quality_info = detect_input_quality(y, sr)
+
+    quality = quality_info['quality']
+
+    if quality == 'clean':
+        # Blend 60% percussive (attack) + 40% harmonic (warmth)
+        logger.info("[HPSS] Clean file → blend 60% perc + 40% harm")
+        return 0.6 * y_percussive + 0.4 * y_harmonic
+    elif quality == 'moderate':
+        logger.info("[HPSS] Moderate file → blend 75% perc + 25% harm")
+        return 0.75 * y_percussive + 0.25 * y_harmonic
+    else:  # noisy
+        logger.info("[HPSS] Noisy file → percussive only (aggressive)")
+        return y_percussive
+
+
+def detect_input_quality(y: np.ndarray, sr: int) -> dict:
+    """Phát hiện chất lượng file nhịp tim: 'clean', 'noisy', hoặc 'moderate'.
+
+    Dựa trên HPSS harmonic/percussive ratio + SNR ước lượng:
+    - harmonic_ratio < 0.6 và snr_db > 5 → clean (ít tạp âm tone)
+    - harmonic_ratio > 1.2 hoặc snr_db < -5 → noisy (nhiều tạp âm)
+    - Trường hợp khác → moderate
+
+    Returns:
+        dict với keys: 'quality', 'snr_db', 'harmonic_ratio', 'energy_variance'
+    """
+    if len(y) == 0:
+        return {
+            'quality': 'moderate',
+            'snr_db': 0.0,
+            'energy_variance': 1.0,
+            'harmonic_ratio': 1.0
+        }
+
+    # HPSS decomposition
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+
+    # Tính energy
+    harm_energy = float(np.mean(y_harmonic ** 2))
+    perc_energy = float(np.mean(y_percussive ** 2))
+
+    # Harmonic ratio (cao = nhiều tiếng người/tone = noisy)
+    harmonic_ratio = harm_energy / (perc_energy + 1e-10)
+
+    # SNR ước lượng (dùng percussive làm signal, harmonic làm noise)
+    if harm_energy > 0:
+        snr_db = 10.0 * np.log10(perc_energy / (harm_energy + 1e-10))
+    else:
+        snr_db = 30.0  # Rất sạch
+
+    # Energy variance (độ ổn định)
+    frame_length = 2048
+    hop_length = 512
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    energy_var = float(np.std(rms) / (np.mean(rms) + 1e-10))
+
+    # Phân loại
+    if harmonic_ratio < 0.6 and snr_db > 5:
+        quality = 'clean'
+    elif harmonic_ratio > 1.2 or snr_db < -5:
+        quality = 'noisy'
+    else:
+        quality = 'moderate'
+
+    logger.info(f"[quality] Detected: {quality}, SNR={snr_db:.1f}dB, "
+                f"harmonic_ratio={harmonic_ratio:.2f}, energy_var={energy_var:.2f}")
+
+    return {
+        'quality': quality,
+        'snr_db': float(snr_db),
+        'energy_variance': energy_var,
+        'harmonic_ratio': float(harmonic_ratio)
+    }
 
 
 def codec_args(output_path: str):
@@ -1113,32 +1232,103 @@ def time_stretch_heartbeat(input_path, output_path, target_tempo, original_tempo
 
 def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
                                      target_duration: float = 10.0,
-                                     min_segment: float = 2.0) -> np.ndarray:
-    """Tìm và ghép đoạn heartbeat ổn định nhất (~10s) từ file gốc.
+                                     min_segment: float = 2.0,
+                                     quality_info: dict = None) -> np.ndarray:
+    """Adaptive segment selection dựa trên chất lượng file.
 
-    Thuật toán:
-    1. Chia audio thành các cửa sổ 2s, tính RMS và độ lệch chuẩn năng lượng ngắn hạn.
-    2. Chọn các cửa sổ có RMS cao nhất (nhiều tín hiệu nhất) và độ biến thiên
-       năng lượng thấp nhất (ổn định nhất, ít nhiễu đột biến).
-    3. Ghép nối liên tiếp cho đến khi đủ target_duration.
-       Nếu không đủ đoạn ổn định, bổ sung thêm đoạn tiếp theo tốt nhất.
-
-    Args:
-        y: numpy array audio mono
-        sr: sample rate
-        target_duration: số giây mong muốn (mặc định 10s)
-        min_segment: độ dài cửa sổ tính điểm (giây)
-
-    Returns:
-        numpy array của đoạn heartbeat đã chọn và ghép nối
+    Clean file: chọn 1 đoạn liền lạc (continuous) → tự nhiên hơn
+    Noisy/moderate: giữ nguyên logic cũ (windowed selection với crossfade)
     """
     if len(y) == 0:
         return y
 
+    # Detect quality nếu chưa có
+    if quality_info is None:
+        quality_info = detect_input_quality(y, sr)
+
+    quality = quality_info.get('quality', 'moderate')
+
+    if quality == 'clean':
+        logger.info(f"[stable_seg] Clean file → selecting continuous segment")
+        return _extract_continuous_segment(y, sr, target_duration)
+    else:
+        logger.info(f"[stable_seg] {quality} file → using windowed selection")
+        return _extract_windowed_segment(y, sr, target_duration, min_segment)
+
+
+def _extract_continuous_segment(y: np.ndarray, sr: int,
+                                target_duration: float = 10.0) -> np.ndarray:
+    """Chọn 1 đoạn liền lạc có RMS cao nhất.
+
+    Không cắt ghép → giữ nhịp tự nhiên cho file sạch.
+    """
+    if len(y) == 0:
+        return y
+
+    target_samples = int(target_duration * sr)
     total_dur = len(y) / sr
-    # Nếu audio quá ngắn, trả về nguyên bản
+
+    # Nếu file đủ ngắn, trả về toàn bộ
     if total_dur <= target_duration:
-        logger.info(f"[stable_seg] Audio ngắn hơn target ({total_dur:.1f}s < {target_duration:.1f}s) → dùng toàn bộ")
+        logger.info(f"[continuous_seg] Audio ngắn hơn target ({total_dur:.1f}s) → dùng toàn bộ")
+        return y
+
+    # Chia thành các cửa sổ chồng lấp 50%
+    win_samples = int(2.0 * sr)  # 2s windows
+    hop_samples = win_samples // 2
+    n_windows = (len(y) - win_samples) // hop_samples + 1
+
+    if n_windows < 2:
+        return y
+
+    # Tính RMS cho mỗi cửa sổ
+    rms_scores = []
+    for i in range(n_windows):
+        start = i * hop_samples
+        end = start + win_samples
+        if end > len(y):
+            break
+        window = y[start:end]
+        rms = float(np.sqrt(np.mean(window ** 2)))
+        rms_scores.append((rms, start, end))
+
+    # Sắp xếp theo RMS giảm dần
+    rms_scores.sort(key=lambda x: -x[0])
+
+    # Chọn top cửa sổ, tìm đoạn liền lạc dài nhất chứa được target_duration
+    best_start = 0
+    best_score = 0
+
+    for rms, start, end in rms_scores[:10]:  # Chỉ xét top 10
+        # Tìm đoạn liền lạc xung quanh start có độ dài >= target_samples
+        candidate_start = max(0, start - target_samples // 2)
+        candidate_end = min(len(y), candidate_start + target_samples)
+        candidate = y[candidate_start:candidate_end]
+
+        # Tính RMS trung bình của đoạn này
+        score = float(np.sqrt(np.mean(candidate ** 2))) * len(candidate)
+
+        if score > best_score:
+            best_score = score
+            best_start = candidate_start
+
+    # Trả về đoạn liền lạc
+    result = y[best_start:best_start + target_samples]
+    actual_dur = len(result) / sr
+    logger.info(f"[continuous_seg] Selected 1 continuous segment: {actual_dur:.1f}s @ sample {best_start}")
+    return result
+
+
+def _extract_windowed_segment(y: np.ndarray, sr: int,
+                               target_duration: float = 10.0,
+                               min_segment: float = 2.0) -> np.ndarray:
+    """Giữ nguyên logic cũ: chọn best windows với crossfade."""
+    if len(y) == 0:
+        return y
+
+    total_dur = len(y) / sr
+    if total_dur <= target_duration:
+        logger.info(f"[windowed_seg] Audio ngắn hơn target ({total_dur:.1f}s) → dùng toàn bộ")
         return y
 
     win_samples = int(min_segment * sr)
@@ -1146,7 +1336,7 @@ def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
     n_frames = (len(y) - win_samples) // hop_samples + 1
 
     if n_frames < 2:
-        logger.info(f"[stable_seg] Không đủ frame để phân tích → dùng toàn bộ")
+        logger.info(f"[windowed_seg] Không đủ frame để phân tích → dùng toàn bộ")
         return y
 
     # Tính điểm cho mỗi cửa sổ
@@ -1156,22 +1346,17 @@ def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
         end = start + win_samples
         frame = y[start:end]
         rms = float(np.sqrt(np.mean(frame ** 2)))
-        # Tính variance của short-time energy (độ ổn định)
         hop_inner = sr // 10  # 100ms hop
         energies = [
             np.mean(frame[j:j+hop_inner] ** 2)
             for j in range(0, len(frame) - hop_inner, hop_inner)
         ]
         energy_var = float(np.std(energies)) if len(energies) > 1 else 1.0
-        # Score: RMS cao + variance thấp = ổn định, ít nhiễu
-        # Normalize: dùng log để tránh outlier
         score = rms / (energy_var + 1e-8)
         scores.append((score, i))
 
-    # Sắp xếp theo score giảm dần
     scores.sort(key=lambda x: -x[0])
 
-    # Greedy: chọn các cửa sổ tốt nhất không chồng chéo quá nhiều
     target_samples = int(target_duration * sr)
     selected_starts = []
     selected_total = 0
@@ -1182,7 +1367,6 @@ def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
             break
         start = idx * hop_samples
         end = start + win_samples
-        # Kiểm tra không chồng chéo >50% với cửa sổ đã chọn
         overlap = False
         for (s, e) in used_ranges:
             overlap_len = max(0, min(end, e) - max(start, s))
@@ -1195,14 +1379,12 @@ def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
             selected_total += win_samples
 
     if not selected_starts:
-        logger.warning("[stable_seg] Không chọn được đoạn nào → dùng toàn bộ")
+        logger.warning("[windowed_seg] Không chọn được đoạn nào → dùng toàn bộ")
         return y
 
-    # Sắp xếp lại theo thứ tự thời gian để nối mượt
     selected_starts.sort()
 
-    # Ghép các đoạn đã chọn với crossfade ngắn
-    crossfade_samples = int(0.05 * sr)  # 50ms crossfade
+    crossfade_samples = int(0.05 * sr)
     segments = []
     for start in selected_starts:
         end = min(start + win_samples, len(y))
@@ -1211,7 +1393,6 @@ def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
     if len(segments) == 1:
         result = segments[0]
     else:
-        # Nối với crossfade
         result = segments[0]
         for seg in segments[1:]:
             if len(result) < crossfade_samples or len(seg) < crossfade_samples:
@@ -1221,12 +1402,11 @@ def extract_stable_heartbeat_segment(y: np.ndarray, sr: int,
                 fade_in = np.linspace(0.0, 1.0, crossfade_samples)
                 result[-crossfade_samples:] = result[-crossfade_samples:] * fade_out
                 seg_start = seg[:crossfade_samples] * fade_in
-                # Blend overlap region
                 blended = result[-crossfade_samples:] + seg_start
                 result = np.concatenate([result[:-crossfade_samples], blended, seg[crossfade_samples:]])
 
     actual_dur = len(result) / sr
-    logger.info(f"[stable_seg] Chọn {len(selected_starts)} đoạn, tổng {actual_dur:.1f}s "
+    logger.info(f"[windowed_seg] Chọn {len(selected_starts)} đoạn, tổng {actual_dur:.1f}s "
                 f"(target {target_duration:.1f}s)")
     return result
 
@@ -1340,11 +1520,16 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             y = np.mean(y, axis=1)
         logger.info(f"[mix] Audio loaded: {len(y)/sr:.1f}s @ {sr}Hz")
  
-        y_denoised = apply_noise_reduction(y, sr)
+
+        # Auto-detect input quality
+        quality_info = detect_input_quality(y, sr)
+        logger.info(f"[mix] Auto-detected quality: {quality_info['quality']}")
+
+        y_denoised = apply_noise_reduction(y, sr, quality_info=quality_info)
         logger.info(f"[mix] HPSS denoising done")
  
         # ── 3. Chọn đoạn heartbeat ổn định nhất ~10s ────────────────────────
-        y_stable = extract_stable_heartbeat_segment(y_denoised, sr, target_duration=10.0)
+        y_stable = extract_stable_heartbeat_segment(y_denoised, sr, target_duration=10.0, quality_info=quality_info)
         sf.write(stable_path, y_stable, sr)
         stable_dur = len(y_stable) / sr
         logger.info(f"[mix] Stable segment extracted: {stable_dur:.1f}s → {stable_path}")
@@ -1459,7 +1644,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             mix_params['heart_ramp_end_s'] = heartbeat_ramp_end_s
             mix_params['heartbeat_intro_envelope'] = heartbeat_intro_envelope
 
-        mix_filter = _build_optimized_mix_filter(mix_params)
+        mix_filter = _build_optimized_mix_filter(mix_params, quality_info)
 
         enc = codec_args(mixed_temp_path)
         picked_mix_input_flag = f'"{picked_mix_input_path}"'
