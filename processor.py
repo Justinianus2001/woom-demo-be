@@ -301,7 +301,7 @@ BPM_SYNC_APPLY_EPS = 0.02
 AMBIENT_HEARTBEAT_WEIGHT = 0.30
 STANDARD_HEARTBEAT_WEIGHT = 0.55
 AFFTDN_NF_MIN_DB = -80.0
-AFFTDN_NF_MAX_DB = -16.0  # Allow -16 for clean files (less aggressive)
+AFFTDN_NF_MAX_DB = -20.0  # FFmpeg afftdn nf valid range is [-80, -20]
 STANDARD_AFFTDN_NF_DB = -20.0
 AMBIENT_AFFTDN_NF_DB = -24.0
 HEARTBEAT_LOOP_CROSSFADE_MS = 120
@@ -346,7 +346,7 @@ def _build_optimized_mix_filter(params: dict, quality_info: dict = None) -> str:
     if quality == 'clean':
         hp_freq = 40
         lp_freq = 420
-        afftdn_nf = -16
+        afftdn_nf = AFFTDN_NF_MAX_DB  # Now -20.0, valid for afftdn nf param
         comp_ratio = 1.3
     elif quality == 'noisy':
         hp_freq = 60
@@ -1674,52 +1674,8 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         else:
             logger.error(f"[mix] ❌ primary mix filter chain failed")
 
-        # If loop bed not ready, need separate fade + 432Hz steps
-        if not loop_bed_ready:
-            logger.info("[mix] Loop bed not ready, applying fade + 432Hz as separate steps")
-            # Fade in/out
-            faded_mixed_path = os.path.join(temp_dir, 'mixed_faded.flac')
-            fade_parts = []
-            if fade_in_s > 0.01:
-                fade_parts.append(f"afade=t=in:st=0:d={fade_in_s:.2f}")
-            if fade_out_s > 0.01:
-                fade_parts.append(f"afade=t=out:st={fade_out_start:.2f}:d={fade_out_s:.2f}")
-            fade_ok = True
-            if fade_parts:
-                fade_filter = ",".join(fade_parts)
-                fade_ok = run_ffmpeg(
-                    f'ffmpeg -y -i "{mixed_temp_path}" '
-                    f'-af "{fade_filter}" '
-                    f'-c:a flac -compression_level 5 "{faded_mixed_path}"'
-                )
-            else:
-                fade_ok = run_ffmpeg(
-                    f'ffmpeg -y -i "{mixed_temp_path}" -c:a flac -compression_level 5 "{faded_mixed_path}"'
-                )
-            if fade_ok and os.path.exists(faded_mixed_path) and os.path.getsize(faded_mixed_path) > 0:
-                logger.info("[mix] ✅ Fade-in/out applied successfully")
-                src_for_432 = faded_mixed_path
-            else:
-                logger.warning("[mix] ⚠️ Fade step failed — applying 432Hz without fade")
-                src_for_432 = mixed_temp_path
-
-            # 432Hz tuning
-            if not tune_to_432hz(src_for_432, mixed_temp_path):
-                logger.warning("[mix] 432Hz tuning failed, exporting original mixed source")
-                if not run_ffmpeg(
-                    f'ffmpeg -y -i "{src_for_432}" {codec_args(mixed_temp_path)} "{mixed_temp_path}"'
-                ):
-                    logger.error("[mix] Final export failed after 432Hz fallback")
-            else:
-                logger.info("[mix] ✅ 432Hz tuning done")
-            # Skip the later fade+432Hz section since we did it here
-            logger.info(f"[mix] ✅ Mix completed -> {mixed_temp_path}")
-            # Skip to validation
-            pass
-            # Jump to validation
-            # (The code will continue to the validation section below)
-        else:
-            # With loop bed ready, fade + 432Hz are already in the filter chain
+        # With loop_bed_ready: fade + 432Hz are already in the optimized filter chain
+        if loop_bed_ready:
             logger.info("[mix] ✅ Fade + 432Hz included in optimized filter chain")
 
         # Nếu loop_bed_ready=True VÀ primary_mix_ok: fade + 432Hz đã nằm trong filter chain
@@ -1776,7 +1732,19 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
 
         if not primary_mix_ok:
             logger.error("[mix] Final mix FFmpeg call failed after safe fallback")
-            return
+            raise RuntimeError("[mix] Primary mix and all fallbacks failed, cannot create output")
+
+
+        # For loop_bed_ready=True: fade+432Hz already in filter chain
+        # Skip health check and fade+432Hz section
+        if loop_bed_ready:
+            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
+                import shutil
+                shutil.copy2(mixed_temp_path, output_path)
+                logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
+                return
+            else:
+                raise RuntimeError("[mix] loop_bed_ready but mixed_temp_path missing/empty")
 
         is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
             mixed_temp_path,
@@ -1831,7 +1799,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             )
             if not fallback_ok:
                 logger.error("[mix] Safe fallback chain failed")
-                return
+                raise RuntimeError("[mix] Safe fallback chain failed, cannot create output")
 
             fb_ok, fb_reason, fb_dur, fb_db = evaluate_mixed_output(
                 fallback_mixed_path,
@@ -1843,10 +1811,23 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             )
             if not fb_ok:
                 logger.error(f"[mix] Fallback output still unhealthy: {fb_reason}")
-                return
+                raise RuntimeError(f"[mix] Fallback output still unhealthy: {fb_reason}")
             mixed_temp_path = fallback_mixed_path
 
+        # After all mix attempts: if loop_bed_ready, fade+432Hz are already applied
+        # → copy mixed_temp_path to output_path and return
+        if loop_bed_ready:
+            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
+                import shutil
+                shutil.copy2(mixed_temp_path, output_path)
+                logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
+                return
+            else:
+                raise RuntimeError("[mix] loop_bed_ready but mixed_temp_path missing/empty after all attempts")
+
         # ── 8. Fade-in / Fade-out → sau đó 432Hz (2 bước riêng) ───────────────
+        # Only runs when loop_bed_ready=False
+        # When loop_bed_ready=True, the code returns above.
         # Dùng sf.info(normalized_asset_path) — ĐÂY LÀ WAV → luôn đọc được.
         # KHÔNG dùng ffprobe hay sf.info(FLAC) vì cả hai đều fail trên Docker.
         #
@@ -1854,7 +1835,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         # → fade_out_start = mixed_dur - fade_out_duration
         if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
             logger.error("[mix] mixed_temp is empty/missing, cannot process")
-            return
+            raise RuntimeError("[mix] mixed_temp is empty/missing, cannot create output")
 
         try:
             mixed_dur_s = float(sf.info(mixed_temp_path).duration)
@@ -1911,6 +1892,13 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         logger.info(f"[mix] ✅ 432Hz tuning done → {output_path}")
 
  
+
+        # ── 9. Final validation ───────────────────────────────
+        if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+            logger.error(f"[mix] CRITICAL: output_path not created at end of function: {output_path}")
+            raise RuntimeError(f"[mix] Output file not created: {output_path}")
+        logger.info(f"[mix] Final output validated: {output_path} (size={os.path.getsize(output_path)})")
+
     except Exception as e:
         logger.error(f"[mix] Error: {e}\n{traceback.format_exc()}")
         logger.error(f"[mix] output_path exists at exception time: {os.path.exists(output_path)}")
