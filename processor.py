@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import shlex
 import signal
@@ -11,6 +12,9 @@ import soundfile as sf
 import logging
 import traceback
 import math
+import hashlib
+import functools
+from pathlib import Path
 
 def _check_lfs_pointer(path: str) -> bool:
     """Check if the file is actually a Git LFS text pointer instead of real audio."""
@@ -24,6 +28,85 @@ def _check_lfs_pointer(path: str) -> bool:
     return False
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Disk Cache for Preprocessed Tracks (LRU, 500MB limit)
+# ---------------------------------------------------------------------------
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cache', 'tracks')
+os.makedirs(CACHE_DIR, exist_ok=True)
+CACHE_MAX_SIZE_MB = 500
+def _get_cache_key(file_path: str, context: str = "") -> str:
+    """Generate a cache key based on file path and modification time.
+
+    Args:
+        file_path: Path to the audio file
+        context: Optional context string to differentiate cache entries
+                 (e.g., 'loudnorm', 'hb-stereo', 'hb-mono', 'stretch-1.200')
+    """
+    try:
+        stat = os.stat(file_path)
+        key_material = f"{os.path.basename(file_path)}_{stat.st_size}_{stat.st_mtime}"
+        if context:
+            key_material += f"_{context}"
+        return hashlib.md5(key_material.encode()).hexdigest()
+    except Exception:
+        # Fallback to filename hash
+        return hashlib.md5((os.path.basename(file_path) + context).encode()).hexdigest()
+
+def _check_cache(cache_key: str) -> str:
+    """Check if file exists in cache, return path if exists."""
+    cache_path = os.path.join(CACHE_DIR, f"{cache_key}.wav")
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        return cache_path
+    return ""
+
+def _save_to_cache(cache_key: str, source_path: str) -> str:
+    """Save file to cache, run LRU eviction if needed."""
+    cache_path = os.path.join(CACHE_DIR, f"{cache_key}.wav")
+    try:
+        shutil.copy2(source_path, cache_path)
+        _cleanup_cache()
+        return cache_path
+    except Exception as e:
+        logger.warning(f"Failed to save to cache: {e}")
+        return source_path
+
+def cleanup_old_cache(directory: str, max_size_mb: int = CACHE_MAX_SIZE_MB) -> None:
+    """LRU eviction: remove oldest files when directory exceeds max_size_mb."""
+    try:
+        if not os.path.exists(directory):
+            return
+        cache_files = []
+        for f in os.listdir(directory):
+            fpath = os.path.join(directory, f)
+            if os.path.isfile(fpath):
+                stat = os.stat(fpath)
+                cache_files.append((fpath, stat.st_mtime, stat.st_size))
+        
+        if not cache_files:
+            return
+        
+        # Sort by modification time (oldest first)
+        cache_files.sort(key=lambda x: x[1])
+        
+        total_size = sum(f[2] for f in cache_files)
+        max_bytes = max_size_mb * 1024 * 1024
+        
+        while total_size > max_bytes and cache_files:
+            oldest_path, _, oldest_size = cache_files.pop(0)
+            try:
+                os.remove(oldest_path)
+                total_size -= oldest_size
+                logger.info(f"Evicted from cache: {os.path.basename(oldest_path)}")
+            except Exception as e:
+                logger.warning(f"Failed to evict cache file: {e}")
+    except Exception as e:
+        logger.warning(f"Cache cleanup failed: {e}")
+
+def _cleanup_cache(max_size_mb: int = CACHE_MAX_SIZE_MB) -> None:
+    """LRU eviction for the global CACHE_DIR."""
+    cleanup_old_cache(CACHE_DIR, max_size_mb)
+
 
 
 def _get_duration_ffprobe(path: str) -> float:
@@ -185,7 +268,7 @@ def detect_tempo(audio_path):
         logger.error(f"❌ Detect tempo thất bại: {e}\n{traceback.format_exc()}")
         return 120.0
 
-FFMPEG_TIMEOUT = 120  # seconds – kill ffmpeg if it runs longer than this
+FFMPEG_TIMEOUT = 60  # seconds – kill ffmpeg if it runs longer than this (optimized from 120s)
 INTRO_DELAY_MS = 5000
 INTRO_SECONDS = INTRO_DELAY_MS / 1000.0
 FADE_IN_SECONDS = 0.0
@@ -196,7 +279,7 @@ HEARTBEAT_MIN_VALID_SECONDS = 0.1
 MIN_REASONABLE_MIX_SECONDS = 8.0
 MIN_DURATION_RATIO_VS_ASSET = 0.55
 SILENT_DBFS_THRESHOLD = -70.0
-MIN_PRECONVERT_ASSET_SECONDS = 8.0
+MIN_PRECONVERT_ASSET_SECONDS = 1.0
 HEARTBEAT_ANALYSIS_SECONDS = 16.0
 TRACK_ANALYSIS_SECONDS = 24.0
 ANALYSIS_FFMPEG_TIMEOUT_SECONDS = 18
@@ -224,6 +307,112 @@ AMBIENT_AFFTDN_NF_DB = -24.0
 HEARTBEAT_LOOP_CROSSFADE_MS = 120
 HEARTBEAT_LOOP_INTRO_SILENCE_MS = int(HEARTBEAT_SILENT_LEAD_SECONDS * 1000)
 HEARTBEAT_LOOP_INTRO_RAMP_MS = int(HEARTBEAT_VOLUME_RAMP_SECONDS * 1000)
+
+
+def _build_optimized_mix_filter(params: dict) -> str:
+    """Build optimized FFmpeg filter chain combining mix + fade + 432Hz.
+
+    Only works when loop_bed_ready=True (finite length heartbeat bed).
+    This merges:
+    - Asset filter (adelay, equalizer, volume)
+    - Picked filter (highpass, lowpass, bass, volume, acompressor, stereowiden, afftdn)
+    - Mix (amix with weights and limiter)
+    - Fade in (if fade_in_s > 0)
+    - Fade out (if fade_out_s > 0, requires fade_out_start)
+    - 432Hz tuning (asetrate + aresample + atempo)
+
+    Args:
+        params: dict with keys:
+            - intro_delay_ms, volume_asset, volume_picked
+            - fade_in_s, fade_out_start, fade_out_s
+            - bpm_mode, use_loop_bed, heart_len_s, sr
+            - lowpass_f (optional, default 350)
+            - heart_ramp_end_s, heartbeat_intro_envelope (for aloop case)
+
+    Returns:
+        Filter chain string ready for -filter_complex
+    """
+    # Asset filter
+    asset_f = (
+        f"[0:a]"
+        f"adelay={params['intro_delay_ms']}|{params['intro_delay_ms']},"
+        f"equalizer=f=100:width_type=o:width=2:g=-5,"
+        f"volume={safe_db(params['volume_asset'])}dB"
+        f"[a0];"
+    )
+
+    # Picked filter
+    lowpass_f = params.get('lowpass_f', 350)
+    if params.get('use_loop_bed'):
+        picked_f = (
+            f"[1:a]"
+            f"highpass=f=60,lowpass=f={lowpass_f},"
+            f"bass=g=4:f=80,"
+            f"volume={safe_db(params['volume_picked'])},"
+            f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
+            f"stereowiden=delay=5,"
+            f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f}"
+            f"[a1];"
+        )
+    else:
+        heart_ramp_end_s = params.get('heart_ramp_end_s', HEARTBEAT_SILENT_LEAD_SECONDS + HEARTBEAT_VOLUME_RAMP_SECONDS)
+        heartbeat_intro_envelope = (
+            f"if(lt(t,{HEARTBEAT_SILENT_LEAD_SECONDS:.2f}),0,"
+            f"if(lt(t,{heart_ramp_end_s:.2f}),"
+            f"(t-{HEARTBEAT_SILENT_LEAD_SECONDS:.2f})/{HEARTBEAT_VOLUME_RAMP_SECONDS:.2f},1))"
+        )
+        picked_f = (
+            f"[1:a]"
+            f"highpass=f=60,lowpass=f={lowpass_f},"
+            f"bass=g=4:f=80,"
+            f"volume='{heartbeat_intro_envelope}':eval=frame,"
+            f"volume={safe_db(params['volume_picked'])},"
+            f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
+            f"stereowiden=delay=5,"
+            f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f},"
+            f"aloop=loop=-1:size={int(params.get('heart_len_s', 10) * params.get('sr', 44100))}"
+            f"[a1];"
+        )
+
+    # Mix + Fade + 432Hz (when loop bed is ready)
+    if params.get('use_loop_bed'):
+        mix_chain = (
+            f"{asset_f}{picked_f}"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
+            f":weights=0.45 0.55,"
+        )
+
+        # Fade in
+        fade_in_s = params.get('fade_in_s', 0)
+        if fade_in_s > 0.01:
+            mix_chain += f"afade=t=in:st=0:d={fade_in_s:.2f},"
+
+        # Fade out
+        fade_out_s = params.get('fade_out_s', 0)
+        fade_out_start = params.get('fade_out_start', 0)
+        if fade_out_s > 0.01:
+            mix_chain += f"afade=t=out:st={fade_out_start:.2f}:d={fade_out_s:.2f},"
+
+        # 432Hz tuning
+        mix_chain += (
+            f"asetrate=44100*432/440,"
+            f"aresample=44100,"
+            f"atempo=1.0185185185185186,"
+        )
+
+        # Limiter
+        mix_chain += f"alimiter=limit=0.9[a]"
+    else:
+        # Keep separate for aloop case (can't fade/432Hz infinite stream)
+        mix_chain = (
+            f"{asset_f}{picked_f}"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
+            f":weights=0.45 0.55,"
+            f"alimiter=limit=0.9"
+            f"[a]"
+        )
+
+    return mix_chain
 
 
 def _clamp_tempo_rate(rate: float, max_stretch: float = MAX_BPM_STRETCH) -> float:
@@ -676,20 +865,20 @@ def _build_looped_heartbeat_bed(
 
 
 def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
-    """Tiền xử lý chung cho cả 3 versions — chỉ chạy MỘT LẦN.
+    """Tiền xử lý chung cho pipeline v1 — chỉ chạy MỘT LẦN.
 
     Thực hiện:
     1. Pre-convert asset audio → PCM WAV chuẩn (handles Wave64/RF64/float/m4a/mp3...)
     2. Loudnorm asset → -16 LUFS
     3. Convert picked (heartbeat) audio → PCM WAV 44100Hz mono+stereo
-       (mono cho v2/v3/v4 HPSS, stereo cho v1 low-pass)
+       (mono cho HPSS, stereo cho v1 low-pass)
     4. Đo volume asset & picked (bằng numpy, KHÔNG subprocess)
 
     Returns:
         dict with keys:
         - 'normalized_asset_path': str – asset WAV đã loudnorm
         - 'picked_wav_stereo': str – heartbeat WAV 44100Hz stereo (cho v1)
-        - 'picked_wav_mono': str – heartbeat WAV 44100Hz mono (cho v2/v3/v4)
+        - 'picked_wav_mono': str – heartbeat WAV 44100Hz mono (cho HPSS)
         - 'asset_volume': float – mean volume dBFS
         - 'error': str | None – machine-readable preprocessing error code
         - 'success': bool
@@ -702,6 +891,34 @@ def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
     normalized_asset_path = os.path.join(work_dir, 'shared_asset_normalized.wav')
     picked_wav_stereo = os.path.join(work_dir, 'shared_picked_stereo.wav')
     picked_wav_mono = os.path.join(work_dir, 'shared_picked_mono.wav')
+
+    # 0) Check cache for normalized asset (skip preconvert + loudnorm if hit)
+    if os.path.exists(asset_audio):
+        asset_cache_key = _get_cache_key(asset_audio, "loudnorm")
+        cached_asset = _check_cache(asset_cache_key)
+        if cached_asset:
+            logger.info(f"[preprocess_shared] Cache hit for normalized asset: {os.path.basename(cached_asset)}")
+            shutil.copy2(cached_asset, normalized_asset_path)
+            asset_volume = fast_mean_volume(normalized_asset_path)
+            # Still need to convert heartbeat (different context)
+            if not _ffmpeg_convert_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono):
+                logger.error(f"[preprocess_shared] Cannot decode heartbeat upload '{picked_audio}'")
+                return {'success': False, 'error': 'heartbeat-decode-failed'}
+            # Cache heartbeat stereo & mono
+            if os.path.exists(picked_audio):
+                hb_cache_key_stereo = _get_cache_key(picked_audio, "hb-stereo")
+                hb_cache_key_mono = _get_cache_key(picked_audio, "hb-mono")
+                _save_to_cache(hb_cache_key_stereo, picked_wav_stereo)
+                _save_to_cache(hb_cache_key_mono, picked_wav_mono)
+                logger.info(f"[preprocess_shared] Cached heartbeat stereo & mono")
+            logger.info(f"[preprocess_shared] Done (from cache). asset_vol={asset_volume:.1f}dB")
+            return {
+                'success': True,
+                'normalized_asset_path': normalized_asset_path,
+                'picked_wav_stereo': picked_wav_stereo,
+                'picked_wav_mono': picked_wav_mono,
+                'asset_volume': asset_volume,
+            }
 
     # 1) Pre-convert asset (worst case tries 7 strategies — but only ONCE)
     if not preconvert_asset(asset_audio, raw_asset_path):
@@ -717,10 +934,24 @@ def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
         return {'success': False, 'error': 'asset-loudnorm-failed'}
     _try_unlink(raw_asset_path)  # free disk space early
 
-    # 3) Convert picked → WAV stereo (v1) và mono (v2/v3/v4), có fallback demuxer.
+    # Save to cache
+    if os.path.exists(asset_audio):
+        asset_cache_key = _get_cache_key(asset_audio, "loudnorm")
+        _save_to_cache(asset_cache_key, normalized_asset_path)
+        logger.info(f"[preprocess_shared] Saved normalized asset to cache")
+
+    # 3) Convert picked → WAV stereo và mono, có fallback demuxer.
     if not _ffmpeg_convert_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono):
         logger.error(f"[preprocess_shared] Cannot decode heartbeat upload '{picked_audio}'")
         return {'success': False, 'error': 'heartbeat-decode-failed'}
+
+    # Cache heartbeat stereo & mono
+    if os.path.exists(picked_audio):
+        hb_cache_key_stereo = _get_cache_key(picked_audio, "hb-stereo")
+        hb_cache_key_mono = _get_cache_key(picked_audio, "hb-mono")
+        _save_to_cache(hb_cache_key_stereo, picked_wav_stereo)
+        _save_to_cache(hb_cache_key_mono, picked_wav_mono)
+        logger.info(f"[preprocess_shared] Cached heartbeat stereo & mono")
 
     # 4) Đo volume asset bằng numpy (0 subprocess)
     asset_volume = fast_mean_volume(normalized_asset_path)
@@ -1034,8 +1265,9 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
         mixed_temp_path     = os.path.join(temp_dir, 'mixed_temp.flac')
  
-        # ── 1. Shared preprocessing ──────────────────────────────────────────
+        # ── 1. Shared preprocessing (with cache) ──────────────────────────────────
         use_shared = bool(shared_data and shared_data.get('success'))
+
         if use_shared:
             temp_wav_path = shared_data['picked_wav_mono']
             normalized_asset_path = shared_data['normalized_asset_path']
@@ -1052,23 +1284,56 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             temp_wav_stereo_path = os.path.join(temp_dir, 'picked_temp_stereo.wav')
             normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
 
-            if not _ffmpeg_convert_heartbeat_variants(picked_audio, temp_wav_stereo_path, temp_wav_path):
-                raise RuntimeError(
-                    "Cannot decode heartbeat upload. Please re-export as PCM WAV, FLAC, or MP3 and try again."
-                )
+            # Check cache for normalized asset
+            use_cache = False
+            if os.path.exists(asset_audio):
+                asset_cache_key = _get_cache_key(asset_audio)
+                logger.debug(f"[cache] Generated key {asset_cache_key} for asset {os.path.basename(asset_audio)}")
+                cached_asset = _check_cache(asset_cache_key)
+                if cached_asset:
+                    logger.info(f"[mix] Cache hit for normalized asset: {os.path.basename(cached_asset)}")
+                    shutil.copy2(cached_asset, normalized_asset_path)
+                    vol_asset = fast_mean_volume(normalized_asset_path)
+                    use_cache = True
+                else:
+                    logger.info(f"[mix] Cache miss for asset {os.path.basename(asset_audio)}")
 
-            raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
-            if not preconvert_asset(asset_audio, raw_asset_path):
-                raise RuntimeError("Cannot decode background track audio for mixing.")
+            if not use_cache:
+                if not _ffmpeg_convert_heartbeat_variants(picked_audio, temp_wav_stereo_path, temp_wav_path):
+                    raise RuntimeError(
+                        "Cannot decode heartbeat upload. Please re-export as PCM WAV, FLAC, or MP3 and try again."
+                    )
 
-            if not run_ffmpeg(
-                f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 '
-                f'-af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"'
-            ):
-                raise RuntimeError("Failed to normalize background track audio for mixing.")
+                raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
+                if not preconvert_asset(asset_audio, raw_asset_path):
+                    raise RuntimeError("Cannot decode background track audio for mixing.")
 
-            vol_asset = fast_mean_volume(normalized_asset_path)
- 
+                if not run_ffmpeg(
+                    f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 '
+                    f'-af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"'
+                ):
+                    raise RuntimeError("Failed to normalize background track audio for mixing.")
+
+                # Save to cache and log details
+                if os.path.exists(asset_audio):
+                    asset_cache_key = _get_cache_key(asset_audio)
+                    _save_to_cache(asset_cache_key, normalized_asset_path)
+                    logger.info(f"[mix] Saved normalized asset to cache: {asset_cache_key}")
+
+                vol_asset = fast_mean_volume(normalized_asset_path)
+
+            # DEBUG: Check cache size and eviction
+            try:
+                from pathlib import Path
+                cache_dir = Path(__file__).parent / 'cache'
+                if cache_dir.exists():
+                    total_mb = sum(p.stat().st_size for p in cache_dir.iterdir()) / 1e6
+                    logger.debug(f"[cache] Current cache size: {total_mb:.2f} MB")
+                    if total_mb > 500:
+                        cleanup_old_cache(str(cache_dir), max_size_mb=500)
+            except Exception as e:
+                logger.debug(f"[cache] Cache size check failed: {e}")
+
         # ── 2. HPSS denoising ────────────────────────────────────────────────
         y, sr = sf.read(temp_wav_path)
         if y.ndim > 1:
@@ -1165,74 +1430,37 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             picked_mix_input_path = normalized_picked_path
             logger.warning("[mix] Loop bed build failed, falling back to legacy heartbeat input")
 
-        asset_filter = (
-            f"[0:a]"
-            f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
-            f"equalizer=f=100:width_type=o:width=2:g=-5,"
-            f"volume={safe_db(max(0, -diff) - (2 if bpm_mode == 'ambient-texture' else 3))}dB"
-            f"[a0];"
-        )
-        if loop_bed_ready:
-            picked_filter = (
-                f"[1:a]"
-                f"highpass=f=60,lowpass=f=350,"
-                f"bass=g=4:f=80,"
-                f"volume={safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6))}dB,"
-                f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
-                f"stereowiden=delay=5,"
-                f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f}"
-                f"[a1];"
-            )
-            if bpm_mode == "ambient-texture":
-                picked_filter = (
-                    f"[1:a]"
-                    f"highpass=f=50,lowpass=f=420,"
-                    f"bass=g=2:f=80,"
-                    f"volume={safe_db(max(0, diff + 0) + 2)}dB,"
-                    f"acompressor=threshold=-20dB:ratio=1.2:attack=12:release=140,"
-                    f"stereowiden=delay=4,"
-                    f"afftdn=nf={safe_afftdn_nf(AMBIENT_AFFTDN_NF_DB):.1f}"
-                    f"[a1];"
-                )
-        else:
+        # Build optimized mix filter chain
+        fade_in_s = FADE_IN_SECONDS
+        fade_out_s = FADE_OUT_SECONDS
+        fade_out_start = max(0.0, (asset_dur_s + INTRO_SECONDS) - fade_out_s) if asset_dur_s > 0 else (INTRO_SECONDS + 12.0)
+
+        mix_params = {
+            'intro_delay_ms': INTRO_DELAY_MS,
+            'volume_asset': safe_db(max(0, -diff) - (2 if bpm_mode == 'ambient-texture' else 3)),
+            'volume_picked': safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6)),
+            'fade_in_s': fade_in_s,
+            'fade_out_s': fade_out_s,
+            'fade_out_start': fade_out_start,
+            'bpm_mode': bpm_mode,
+            'use_loop_bed': loop_bed_ready,
+            'heart_len_s': heart_len_s,
+            'sr': sr,
+            'lowpass_f': 420 if bpm_mode == "ambient-texture" else 350,
+        }
+
+        if not loop_bed_ready:
             heartbeat_ramp_end_s = HEARTBEAT_SILENT_LEAD_SECONDS + HEARTBEAT_VOLUME_RAMP_SECONDS
             heartbeat_intro_envelope = (
                 f"if(lt(t,{HEARTBEAT_SILENT_LEAD_SECONDS:.2f}),0,"
                 f"if(lt(t,{heartbeat_ramp_end_s:.2f}),"
                 f"(t-{HEARTBEAT_SILENT_LEAD_SECONDS:.2f})/{HEARTBEAT_VOLUME_RAMP_SECONDS:.2f},1))"
             )
-            picked_filter = (
-                f"[1:a]"
-                f"highpass=f=60,lowpass=f=350,"
-                f"bass=g=4:f=80,"
-                f"volume='{heartbeat_intro_envelope}':eval=frame,"
-                f"volume={safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6))}dB,"
-                f"acompressor=threshold=-18dB:ratio=1.5:attack=8:release=100,"
-                f"stereowiden=delay=5,"
-                f"afftdn=nf={safe_afftdn_nf(STANDARD_AFFTDN_NF_DB):.1f},"
-                f"aloop=loop=-1:size={int(heart_len_s * sr)}"
-                f"[a1];"
-            )
-            if bpm_mode == "ambient-texture":
-                picked_filter = (
-                    f"[1:a]"
-                    f"highpass=f=50,lowpass=f=420,"
-                    f"bass=g=2:f=80,"
-                    f"volume='{heartbeat_intro_envelope}':eval=frame,"
-                    f"volume={safe_db(max(0, diff + 0) + 2)}dB,"
-                    f"acompressor=threshold=-20dB:ratio=1.2:attack=12:release=140,"
-                    f"stereowiden=delay=4,"
-                    f"afftdn=nf={safe_afftdn_nf(AMBIENT_AFFTDN_NF_DB):.1f},"
-                    f"aloop=loop=-1:size={int(heart_len_s * sr)}"
-                    f"[a1];"
-                )
-        mix_filter = (
-            f"{asset_filter}{picked_filter}"
-            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
-            f":weights=0.45 0.55,"
-            f"alimiter=limit=0.9"
-            f"[a]"
-        )
+            mix_params['heart_ramp_end_s'] = heartbeat_ramp_end_s
+            mix_params['heartbeat_intro_envelope'] = heartbeat_intro_envelope
+
+        mix_filter = _build_optimized_mix_filter(mix_params)
+
         enc = codec_args(mixed_temp_path)
         picked_mix_input_flag = f'"{picked_mix_input_path}"'
         primary_mix_ok = run_ffmpeg(
@@ -1240,8 +1468,63 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f'-filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
         )
 
+        # If loop bed not ready, need separate fade + 432Hz steps
+        if not loop_bed_ready:
+            logger.info("[mix] Loop bed not ready, applying fade + 432Hz as separate steps")
+            # Fade in/out
+            faded_mixed_path = os.path.join(temp_dir, 'mixed_faded.flac')
+            fade_parts = []
+            if fade_in_s > 0.01:
+                fade_parts.append(f"afade=t=in:st=0:d={fade_in_s:.2f}")
+            if fade_out_s > 0.01:
+                fade_parts.append(f"afade=t=out:st={fade_out_start:.2f}:d={fade_out_s:.2f}")
+            fade_ok = True
+            if fade_parts:
+                fade_filter = ",".join(fade_parts)
+                fade_ok = run_ffmpeg(
+                    f'ffmpeg -y -i "{mixed_temp_path}" '
+                    f'-af "{fade_filter}" '
+                    f'-c:a flac -compression_level 5 "{faded_mixed_path}"'
+                )
+            else:
+                fade_ok = run_ffmpeg(
+                    f'ffmpeg -y -i "{mixed_temp_path}" -c:a flac -compression_level 5 "{faded_mixed_path}"'
+                )
+            if fade_ok and os.path.exists(faded_mixed_path) and os.path.getsize(faded_mixed_path) > 0:
+                logger.info("[mix] ✅ Fade-in/out applied successfully")
+                src_for_432 = faded_mixed_path
+            else:
+                logger.warning("[mix] ⚠️ Fade step failed — applying 432Hz without fade")
+                src_for_432 = mixed_temp_path
+
+            # 432Hz tuning
+            if not tune_to_432hz(src_for_432, mixed_temp_path):
+                logger.warning("[mix] 432Hz tuning failed, exporting original mixed source")
+                if not run_ffmpeg(
+                    f'ffmpeg -y -i "{src_for_432}" {codec_args(mixed_temp_path)} "{mixed_temp_path}"'
+                ):
+                    logger.error("[mix] Final export failed after 432Hz fallback")
+            else:
+                logger.info("[mix] ✅ 432Hz tuning done")
+            # Skip the later fade+432Hz section since we did it here
+            logger.info(f"[mix] ✅ Mix completed -> {mixed_temp_path}")
+            # Skip to validation
+            pass
+            # Jump to validation
+            # (The code will continue to the validation section below)
+        else:
+            # With loop bed ready, fade + 432Hz are already in the filter chain
+            logger.info("[mix] ✅ Fade + 432Hz included in optimized filter chain")
+
         if not primary_mix_ok:
             logger.warning("[mix] Primary filter chain failed, retrying with safe fallback mix chain")
+            asset_filter = (
+                f"[0:a]"
+                f"adelay={mix_params['intro_delay_ms']}|{mix_params['intro_delay_ms']},"
+                f"equalizer=f=100:width_type=o:width=2:g=-5,"
+                f"volume={safe_db(mix_params['volume_asset'])}dB"
+                f"[a0];"
+            )
             if loop_bed_ready:
                 fallback_picked_filter = (
                     f"[1:a]"
@@ -1419,342 +1702,3 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         temp_dir_obj.cleanup()
  
 
-def mix_audio_v2(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, shared_data=None):
-    """Version 2: Clean Heartbeat + 432Hz — HPSS separation, ấm áp hơn.
-
-    - HPSS: Tách percussive → heartbeat sạch, rõ từng nhịp (v1 dùng low-pass)
-    - Dynamic silence threshold → loại noise chính xác hơn fixed -40dB của v1
-    - 432Hz tuning → tần số ấm áp, thư giãn hơn (v1/v3 không có)
-    - weights 0.65/0.35 → heartbeat rõ nhưng nhạc nổi hơn v1
-    - BỎ: Cắt 4 nhịp + aloop vô hạn → gây nhịp tim máy móc
-    - BỎ: Asset stretch (tempo_factor luôn = 1.0, code thừa)
-    - THÊM: Dùng toàn bộ heartbeat (≤30s), duration=shortest, fade-out cuối
-    - Nhận shared_data từ preprocess_shared() → bỏ preconvert_asset, loudnorm, convert picked
-    - Dùng fast_mean_volume (numpy) thay vì get_mean_volume (subprocess)
-    - Giảm từ ~13 FFmpeg calls → ~3 calls (silence-remove + mix + 432Hz)
-    """
-
-    logger.info(f"[v2] Starting mix_audio_v2 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
-    temp_dir_obj = tempfile.TemporaryDirectory()
-    temp_dir = temp_dir_obj.name
-    try:
-        denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
-        silenced_path = os.path.join(temp_dir, 'picked_silenced.wav')
-        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
-        mixed_temp_path = os.path.join(temp_dir, 'mixed_temp.mp3')
-
-        # === Lấy dữ liệu đã tiền xử lý hoặc fallback ===
-        if shared_data and shared_data.get('success'):
-            temp_wav_path = shared_data['picked_wav_mono']
-            normalized_asset_path = shared_data['normalized_asset_path']
-            vol_asset = shared_data['asset_volume']
-            logger.info(f"[v2] Using shared preprocessed data (0 FFmpeg calls for convert/preconvert)")
-        else:
-            # Fallback: xử lý riêng (backward compatible)
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
-            normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
-            run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 2 -ar 44100 "{temp_wav_path}"')
-            raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
-            if not preconvert_asset(asset_audio, raw_asset_path):
-                logger.error(f"[v2] Cannot decode asset audio '{asset_audio}', aborting.")
-                return
-            run_ffmpeg(f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
-            vol_asset = get_mean_volume(normalized_asset_path)
-
-        # [ĐẶC TRƯNG V2] HPSS — tách percussive (nhịp tim) khỏi harmonic (noise)
-        # Cho heartbeat sạch hơn low-pass filter của v1
-        y, sr = sf.read(temp_wav_path)
-        if y.ndim > 1: y = np.mean(y, axis=1)
-        y_denoised = apply_noise_reduction(y, sr)
-        logger.info(f"[v2] Finished denoising picked audio: {denoised_path}")
-        sf.write(denoised_path, y_denoised, sr)
-
-        # [ĐẶC TRƯNG V2] Dynamic threshold — tính từ peak, chính xác hơn fixed -40dB của v1
-        max_val = np.max(np.abs(y_denoised)) if len(y_denoised) > 0 else 0
-        if max_val > 0:
-            peak_db = librosa.amplitude_to_db(max_val)
-            threshold_db = max(-50, peak_db - 30)
-        else:
-            threshold_db = -50
-        logger.info(f"[v2] Dynamic threshold: {threshold_db:.1f}dB")
-        # FFmpeg call #1 — silence remove
-        run_ffmpeg(f'ffmpeg -y -i "{denoised_path}" -af silenceremove=start_periods=1:start_duration=0:start_threshold={threshold_db}dB:detection=peak "{silenced_path}"')
-        logger.info(f"[v2] Removed silence: {silenced_path}")
-
-        # Normalize heartbeat — RMS-based normalization thay vì peak-only
-        # Vấn đề: HPSS tạo signal sparse (chỉ có impulse nhịp) → peak normalize không đủ
-        # RMS target -12dBFS → heartbeat nghe rõ hơn trong mix
-        picked_seg = AudioSegment.from_file(silenced_path, format="wav").normalize()
-        # Sau peak normalize, nếu RMS vẫn thấp (signal sparse), boost thêm đến target -12dBFS
-        target_rms_dbfs = -12.0
-        if picked_seg.dBFS < target_rms_dbfs:
-            boost = target_rms_dbfs - picked_seg.dBFS
-            picked_seg = picked_seg + min(boost, 18.0)  # cap 18dB tránh noise explosion
-            logger.info(f"[v2] RMS boost applied: +{min(boost, 18.0):.1f}dB (dBFS was {picked_seg.dBFS - min(boost, 18.0):.1f})")
-        picked_seg.export(normalized_picked_path, format="wav")
-        heart_len_s = len(picked_seg) / 1000.0
-        logger.info(f"[v2] Normalized heartbeat: duration={heart_len_s:.1f}s, dBFS={picked_seg.dBFS:.1f}")
-
-        # Đo volume — numpy direct (0 subprocess)
-        vol_picked = fast_mean_volume(normalized_picked_path)
-        diff = vol_asset - vol_picked
-        logger.info(f"[v2] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
-
-        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff) - 3)}dB[a0];"
-
-        picked_filter = (
-            f"[1:a]"
-            f"highpass=f=40,lowpass=f=250,"            # Chặt hơn: 40-250Hz, loại bỏ hoàn toàn tần số giọng người
-            f"bass=g=5:f=80,"                          # Tăng nhẹ bass 80Hz (tần số tâm thu)
-            f"volume={safe_db(max(2, diff+2) + 8)}dB,"   # +8dB (tăng từ +6) → nghe rõ hơn 20% còn thiếu
-            f"acompressor=threshold=-18dB:ratio=1.5:attack=10:release=120,"  # Nén rất nhẹ, giữ dynamic tự nhiên
-            f"stereowiden=delay=6,"
-            f"aloop=loop=-1:size={int(heart_len_s * 44100)}"
-            f"[a1];"
-        )
-
-        # [ĐẶC TRƯNG V2] weights: nhạc nền 35% / heartbeat 65%
-        enc = codec_args(mixed_temp_path)
-        mix_filter = (
-            f"{asset_filter}{picked_filter}"
-            # Giảm dải mid nhạc nền để heartbeat không bị che
-            f"[a0]equalizer=f=100:width_type=o:width=2:g=-5[a0clean];"
-            f"[a0clean][a1]amix=inputs=2:duration=first:dropout_transition=2"
-            f":weights=0.45 0.55,"
-            f"alimiter=limit=0.9[a]"
-        )
-        # FFmpeg call #2 — mix
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"')
-
-        # [ĐẶC TRƯNG V2] 432Hz tuning — tần số ấm áp, thư giãn hơn 440Hz
-        # FFmpeg call #3 — 432Hz pitch shift
-        if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
-            logger.error(f"[v2] mixed_temp.mp3 is empty or missing, aborting 432Hz step.")
-        else:
-            tune_to_432hz(mixed_temp_path, output_path)
-        logger.info(f"[v2] Finished successfully -> {output_path}")
-    except Exception as e:
-        logger.error(f"[v2] Error during mix_audio_v2: {e}\n{traceback.format_exc()}")
-        raise
-    finally:
-        temp_dir_obj.cleanup()
-
-def mix_audio_v3(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None, shared_data=None):
-    """Version 3: Tempo-Synced Music — nhạc nền adapt tempo theo heartbeat.
-    - NHẠC NỀN được stretch tempo để match BPM của heartbeat → nhịp đồng bộ
-    - BỎ: Cắt 4 nhịp + aloop → nhịp tim máy móc
-    - THÊM: duration=shortest, fade-out cuối
-    - Nhận shared_data → bỏ preconvert_asset (tiết kiệm tới 7 FFmpeg calls)
-    - Dùng shared normalized_asset_path làm input cho atempo stretch
-    - Giảm từ ~14 FFmpeg calls → ~4 calls (atempo + loudnorm + mix)
-    """
-    if heart_tempo is None:
-        _, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
-    if heart_tempo <= 0: heart_tempo = 120.0
-    if music_tempo is None:
-        music_tempo = detect_tempo(asset_audio)
-    if music_tempo <= 0: music_tempo = 120.0
-
-    logger.info(f"[v3] Starting mix_audio_v3 for picked='{picked_audio}', asset='{asset_audio}', output='{output_path}'")
-    temp_dir_obj = tempfile.TemporaryDirectory()
-    temp_dir = temp_dir_obj.name
-    try:
-        denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
-        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
-        stretched_asset_path = os.path.join(temp_dir, 'asset_stretched.wav')
-        normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
-
-        # === Lấy dữ liệu đã tiền xử lý hoặc fallback ===
-        if shared_data and shared_data.get('success'):
-            temp_wav_path = shared_data['picked_wav_mono']
-            # V3 cần stretch asset → dùng shared normalized asset làm input
-            # (đã là PCM WAV chuẩn, bỏ qua preconvert_asset)
-            shared_asset_path = shared_data['normalized_asset_path']
-            logger.info(f"[v3] Using shared preprocessed data (0 FFmpeg calls for convert/preconvert)")
-        else:
-            # Fallback: xử lý riêng (backward compatible)
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
-            run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
-            raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
-            if not preconvert_asset(asset_audio, raw_asset_path):
-                logger.error(f"[v3] Cannot decode asset audio '{asset_audio}', aborting.")
-                return
-            shared_asset_path = raw_asset_path
-
-        # HPSS
-        y, sr = sf.read(temp_wav_path)
-        if y.ndim > 1: y = np.mean(y, axis=1)
-        y_denoised = apply_noise_reduction(y, sr)
-        logger.info(f"[v3] Finished denoising picked audio: {denoised_path}")
-        sf.write(denoised_path, y_denoised, sr)
-        logger.info(f"[v3] HPSS denoised: {denoised_path}")
-
-        # Normalize heartbeat — pydub direct WAV load (0 subprocess)
-        picked_seg = AudioSegment.from_file(denoised_path, format='wav').normalize() - 14
-        picked_seg.export(normalized_picked_path, format="wav")
-        heart_len_s = len(picked_seg) / 1000.0
-        logger.info(f"[v3] Normalized heartbeat (no stretch): duration={heart_len_s:.1f}s")
-
-        # === NHẠC NỀN: Stretch tempo để match heartbeat BPM ===
-        # [ĐẶC TRƯNG V3] ĐẢO logic: nhạc adapt theo heartbeat, không phải ngược lại
-        # VD: heart=70BPM, music=120BPM → rate=70/120=0.58 → nhạc chậm lại match nhịp tim
-        tempo_rate = heart_tempo / music_tempo
-        tempo_rate = max(0.75, min(1.25, tempo_rate))  # Clamp tránh FFmpeg atempo quá extreme
-        logger.info(f"[v3] Stretching music: rate={tempo_rate:.3f} (heart={heart_tempo:.0f} / music={music_tempo:.0f})")
-
-        # FFmpeg call #1 — atempo stretch asset (dùng shared asset đã convert, bỏ preconvert)
-        atempo_str = get_atempo_filter(tempo_rate)
-        run_ffmpeg(f'ffmpeg -y -i "{shared_asset_path}" -filter:a "{atempo_str}" "{stretched_asset_path}"')
-        # FFmpeg call #2 — loudnorm stretched asset
-        run_ffmpeg(f'ffmpeg -y -i "{stretched_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
-        logger.info(f"[v3] Normalized stretched asset: {normalized_asset_path}")
-
-        # Đo volume — numpy direct (0 subprocess)
-        vol_asset = fast_mean_volume(normalized_asset_path)
-        vol_picked = fast_mean_volume(normalized_picked_path)
-        diff = vol_asset - vol_picked
-        logger.info(f"[v3] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
-
-        asset_filter = f"[0:a]adelay=2000|2000,volume={safe_db(max(0, -diff + 2))}dB[a0];"
-
-        picked_filter = (
-            f"[1:a]"
-            f"volume={safe_db(max(10, diff + 12))}dB,"
-            f"highpass=f=120,lowpass=f=400,"
-            f"bass=g=5:f=80,"
-            # f"treble=g=4:f=3500,"
-            f"acompressor=threshold=-24dB:ratio=2:attack=5:release=80,"
-            f"aecho=0.8:0.7:40|80:0.25|0.15,"
-            # extrastereo: mở rộng stereo field (m=1.6) → nhịp tim lan toả không gian
-            f"extrastereo=m=1.6,"
-            f"aloop=loop=-1:size=2e+09"
-            f"[a1];"
-        )
-
-        # [SỬA LỖI] duration=first → output dài bằng nhạc nền (a0)
-        enc = codec_args(output_path)
-        mix_filter = (
-            f"{asset_filter}{picked_filter}"
-            f"[a0][a1]"
-            f"amix=inputs=2:duration=first:dropout_transition=2"
-            f":weights=0.3 0.7,"
-            f"alimiter=limit=0.9"
-            f"[a]"
-        )
-        # FFmpeg call #3 — final mix
-        if run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{output_path}"'):
-            logger.info(f"[v3] Finished successfully -> {output_path}")
-        else:
-            logger.error(f"[v3] mix_audio_v3 failed at final stage")
-    except Exception as e:
-        logger.error(f"[v3] Error during mix_audio_v3: {e}\n{traceback.format_exc()}")
-        raise
-    finally:
-        temp_dir_obj.cleanup()
-
-def mix_audio_v4(asset_audio, picked_audio, output_path, heart_duration=None, heart_tempo=None, music_tempo=None, shared_data=None):
-    """Version 4: Double-Time + 432Hz — heartbeat tăng gấp đôi, năng lượng cao.
-
-    ĐẶC TRƯNG V4 (phân biệt với v1/v2/v3):
-    - Heartbeat stretch lên 2x music tempo → nhịp nhanh, năng lượng cao
-      (Đây là version DUY NHẤT được phép thay đổi BPM heartbeat — theo feedback KH)
-    - 432Hz tuning → tần số ấm áp kết hợp nhịp nhanh
-    - weights 0.7/0.3 → cân bằng nhạc + heartbeat nhanh
-
-    THAY ĐỔI 03/2026 (feedback khách hàng — nhịp tim không tự nhiên):
-    - GIỮ: Stretch heartbeat 2x (khách hàng cho phép version này)
-    - BỎ: Cắt 4 nhịp + aloop → dùng toàn bộ heartbeat đã stretch
-    - THÊM: duration=shortest, fade-out cuối
-
-    TỐI ƯU 03/2026:
-    - Nhận shared_data → bỏ preconvert_asset, convert picked, get_mean_volume
-    - Giảm từ ~15 FFmpeg calls → ~4 calls (stretch-heartbeat + mix + 432Hz)
-    """
-    if heart_tempo is None:
-        _, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
-    if heart_tempo <= 0: heart_tempo = 120.0
-    if music_tempo is None:
-        music_tempo = detect_tempo(asset_audio)
-    if music_tempo <= 0: music_tempo = 120.0
-
-    target_heartbeat_tempo = music_tempo * 2
-    logger.info(f"[v4] Starting mix_audio_v4: heart={heart_tempo:.0f}BPM → target={target_heartbeat_tempo:.0f}BPM (2x music)")
-    temp_dir_obj = tempfile.TemporaryDirectory()
-    temp_dir = temp_dir_obj.name
-    try:
-        denoised_path = os.path.join(temp_dir, 'picked_denoised.wav')
-        stretched_path = os.path.join(temp_dir, 'picked_stretched.wav')
-        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
-        mixed_temp_path = os.path.join(temp_dir, 'mixed_temp.mp3')
-
-        # === Lấy dữ liệu đã tiền xử lý hoặc fallback ===
-        if shared_data and shared_data.get('success'):
-            temp_wav_path = shared_data['picked_wav_mono']
-            normalized_asset_path = shared_data['normalized_asset_path']
-            vol_asset = shared_data['asset_volume']
-            logger.info(f"[v4] Using shared preprocessed data (0 FFmpeg calls for convert/preconvert)")
-        else:
-            # Fallback: xử lý riêng (backward compatible)
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
-            normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
-            run_ffmpeg(f'ffmpeg -y -i "{picked_audio}" -t 30 -ac 1 -ar 44100 "{temp_wav_path}"')
-            raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
-            if not preconvert_asset(asset_audio, raw_asset_path):
-                logger.error(f"[v4] Cannot decode asset audio '{asset_audio}', aborting.")
-                return
-            run_ffmpeg(f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 -af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"')
-            vol_asset = get_mean_volume(normalized_asset_path)
-
-        # HPSS
-        y, sr = sf.read(temp_wav_path)
-        if y.ndim > 1: y = np.mean(y, axis=1)
-        logger.info(f"[v4] Finished reading picked audio: {temp_wav_path}")
-        y_denoised = apply_noise_reduction(y, sr)
-        sf.write(denoised_path, y_denoised, sr)
-        logger.info(f"[v4] Finished denoising picked audio: {denoised_path}")
-
-        # [GIỮ NGUYÊN] Stretch heartbeat lên 2x music tempo — khách hàng cho phép v4
-        # FFmpeg call #1 — time stretch heartbeat (1-2 calls bên trong)
-        time_stretch_heartbeat(denoised_path, stretched_path, target_heartbeat_tempo, heart_tempo)
-        logger.info(f"[v4] Stretched heartbeat: {heart_tempo:.0f} → {target_heartbeat_tempo:.0f} BPM")
-
-        # Normalize heartbeat — pydub direct WAV load (0 subprocess)
-        # stretched_path is WAV output from time_stretch_heartbeat
-        picked_seg = AudioSegment.from_file(stretched_path, format='wav').normalize()
-        if picked_seg.dBFS < -25: picked_seg += 3
-        picked_seg.export(normalized_picked_path, format="wav")
-        heart_len_s = len(picked_seg) / 1000.0
-        logger.info(f"[v4] Normalized stretched heartbeat: duration={heart_len_s:.1f}s")
-
-        # Đo volume — numpy direct (0 subprocess)
-        vol_picked = fast_mean_volume(normalized_picked_path)
-        diff = vol_asset - vol_picked
-        logger.info(f"[v4] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB")
-
-        asset_filter = f"[0:a]volume={safe_db(max(0, -diff + 2))}dB[a0];"
-        # [SỬA LỖI] Phải dùng aloop để lặp lại heartbeat theo chiều dài bài hát
-        picked_filter = f"[1:a]volume={safe_db(max(0, diff))}dB,aloop=loop=-1:size=2e+09[a1];"
-
-        # [SỬA LỖI] duration=first → dài bằng nhạc nền
-        # weights=0.75 0.25 → cân bằng nhạc + heartbeat nhanh
-        enc = codec_args(mixed_temp_path)
-        mix_filter = (
-            f"{asset_filter}{picked_filter}"
-            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
-            f":weights=0.7 0.3[a]"
-        )
-        # FFmpeg call #2 — mix
-        run_ffmpeg(f'ffmpeg -y -i "{normalized_asset_path}" -i "{normalized_picked_path}" -filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"')
-
-        # [ĐẶC TRƯNG V4] 432Hz tuning — ấm áp + nhịp nhanh
-        # FFmpeg call #3 — 432Hz pitch shift
-        if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
-            logger.error(f"[v4] mixed_temp.mp3 is empty or missing, aborting 432Hz step.")
-        else:
-            tune_to_432hz(mixed_temp_path, output_path)
-        logger.info(f"[v4] Finished successfully -> {output_path}")
-    except Exception as e:
-        logger.error(f"[v4] Error during mix_audio_v4: {e}\n{traceback.format_exc()}")
-        raise
-    finally:
-        temp_dir_obj.cleanup()
