@@ -296,10 +296,27 @@ def is_generated_mix_track_name(track_name: str) -> bool:
         return False
 
     return bool(
+        # Mẫu: mixed-guest-... hoặc mixed_sound_... (generated output có tiền tố mixed)
+        re.match(r"^mixed[-_].+", normalized)
         # Mẫu: mixed-<hex_chars> (8+ ký tự hex)
-        re.match(r"^mixed[-_][a-f0-9]{8,}(?:[-_][a-f0-9]{8,})*(?:\.[a-z0-9]+)?$", normalized)
+        or re.match(r"^mixed[-_][a-f0-9]{8,}(?:[-_][a-f0-9]{8,})*(?:\.[a-z0-9]+)?$", normalized)
         # Hoặc: v1_mixed, v2_mixed, ... (legacy)
         or re.match(r"^v\d+_mixed(?:\.[a-z0-9]+)?$", normalized)
+    )
+
+
+def is_mixed_sound_track(track_name: str, display_name: str = "", file_type: str = "") -> bool:
+    """Nhận diện các object mixed-sound để loại khỏi danh sách metadata."""
+    normalized_type = str(file_type or "").strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    if normalized_type == "mixedsound":
+        return True
+
+    normalized_track = os.path.basename(str(track_name or "")).strip().lower()
+    normalized_display = os.path.basename(str(display_name or "")).strip().lower()
+
+    return any(
+        token in normalized_track or token in normalized_display
+        for token in ("mixed-sound", "mixed_sound", "mixed sound")
     )
 
 
@@ -625,6 +642,11 @@ def _fetch_track_candidate(
     # Giải quyết metadata từ head_data
     resolved_meta = resolve_track_meta_from_head(head_data, raw_key, key_name)
     display_name = str(resolved_meta.get("display_name") or key_name).strip() or key_name
+
+    # Loại bỏ mixed-sound khỏi metadata endpoint, nhưng giữ heartbeat/trackbeat bình thường.
+    if is_mixed_sound_track(key_name, display_name, resolved_meta.get("file_type", "")):
+        logger.debug("Skipping mixed-sound entry: key='%s' display='%s'", key_name, display_name)
+        return None
 
     # Lọc bỏ track mix (kết quả từ các lần mix trước)
     if is_generated_mix_track_name(display_name):
