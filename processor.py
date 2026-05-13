@@ -71,6 +71,37 @@ def _save_to_cache(cache_key: str, source_path: str) -> str:
         logger.warning(f"Failed to save to cache: {e}")
         return source_path
 
+def _restore_cached_heartbeat_variants(picked_audio: str, stereo_path: str, mono_path: str) -> bool:
+    """Restore cached heartbeat WAV variants when the same source file is reused."""
+    if not os.path.exists(picked_audio):
+        return False
+
+    stereo_cache = _check_cache(_get_cache_key(picked_audio, "hb-stereo"))
+    mono_cache = _check_cache(_get_cache_key(picked_audio, "hb-mono"))
+    if not (stereo_cache and mono_cache):
+        return False
+
+    try:
+        shutil.copy2(stereo_cache, stereo_path)
+        shutil.copy2(mono_cache, mono_path)
+    except Exception as e:
+        logger.warning(f"[preprocess_shared] Failed to restore cached heartbeat variants: {e}")
+        return False
+
+    if _is_valid_decoded_audio(mono_path) and _is_valid_decoded_audio(stereo_path):
+        logger.info("[preprocess_shared] Cache hit for heartbeat stereo & mono")
+        return True
+
+    return False
+
+def _cache_heartbeat_variants(picked_audio: str, stereo_path: str, mono_path: str) -> None:
+    if not os.path.exists(picked_audio):
+        return
+
+    _save_to_cache(_get_cache_key(picked_audio, "hb-stereo"), stereo_path)
+    _save_to_cache(_get_cache_key(picked_audio, "hb-mono"), mono_path)
+    logger.info("[preprocess_shared] Cached heartbeat stereo & mono")
+
 def cleanup_old_cache(directory: str, max_size_mb: int = CACHE_MAX_SIZE_MB) -> None:
     """LRU eviction: remove oldest files when directory exceeds max_size_mb."""
     try:
@@ -306,7 +337,10 @@ AFFTDN_NF_MIN_DB = -80.0
 AFFTDN_NF_MAX_DB = -20.0  # FFmpeg afftdn nf valid range is [-80, -20]
 STANDARD_AFFTDN_NF_DB = -20.0
 AMBIENT_AFFTDN_NF_DB = -24.0
-HEARTBEAT_LOOP_CROSSFADE_MS = 120
+HEARTBEAT_LOOP_CROSSFADE_MS = 180
+HEARTBEAT_LOOP_TRIM_CHUNK_MS = 10
+HEARTBEAT_LOOP_TRIM_PRE_ROLL_MS = 80
+HEARTBEAT_LOOP_TRIM_TAIL_MS = 260
 HEARTBEAT_LOOP_INTRO_SILENCE_MS = int(HEARTBEAT_SILENT_LEAD_SECONDS * 1000)
 HEARTBEAT_LOOP_INTRO_RAMP_MS = int(HEARTBEAT_VOLUME_RAMP_SECONDS * 1000)
 
@@ -361,6 +395,9 @@ def _build_optimized_mix_filter(params: dict, quality_info: dict = None) -> str:
         afftdn_nf = -18
         comp_ratio = 1.4
 
+    asset_weight = float(params.get('asset_weight', 0.45))
+    heart_weight = float(params.get('heart_weight', 0.55))
+
     # Asset filter
     asset_f = (
         f"[0:a]"
@@ -407,7 +444,7 @@ def _build_optimized_mix_filter(params: dict, quality_info: dict = None) -> str:
         mix_chain = (
             f"{asset_f}{picked_f}"
             f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
-            f":weights=0.45 0.55,"
+            f":weights={asset_weight:.3f} {heart_weight:.3f},"
         )
 
         # Fade in
@@ -435,7 +472,7 @@ def _build_optimized_mix_filter(params: dict, quality_info: dict = None) -> str:
         mix_chain = (
             f"{asset_f}{picked_f}"
             f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=3"
-            f":weights=0.45 0.55,"
+            f":weights={asset_weight:.3f} {heart_weight:.3f},"
             f"alimiter=limit=0.9"
             f"[a]"
         )
@@ -867,6 +904,62 @@ def evaluate_mixed_output(mix_path: str, expected_asset_duration: float = 0.0):
     return True, "ok", measured_duration, measured_dbfs
 
 
+def _trim_heartbeat_loop_source(
+    source: AudioSegment,
+    chunk_ms: int = HEARTBEAT_LOOP_TRIM_CHUNK_MS,
+    pre_roll_ms: int = HEARTBEAT_LOOP_TRIM_PRE_ROLL_MS,
+    tail_ms: int = HEARTBEAT_LOOP_TRIM_TAIL_MS,
+) -> AudioSegment:
+    """Trim leading/trailing silence so loop joins happen near real heartbeat events."""
+    if len(source) <= 0:
+        return source
+
+    chunk_ms = max(5, int(chunk_ms))
+    pre_roll_ms = max(0, int(pre_roll_ms))
+    tail_ms = max(0, int(tail_ms))
+
+    chunks = []
+    for start in range(0, len(source), chunk_ms):
+        chunk = source[start:start + chunk_ms]
+        if len(chunk) > 0:
+            chunks.append((start, chunk.rms))
+
+    if not chunks:
+        return source
+
+    rms_values = [rms for _, rms in chunks]
+    max_rms = max(rms_values)
+    if max_rms <= 0:
+        return source
+
+    sorted_rms = sorted(rms_values)
+    noise_floor = sorted_rms[max(0, int(len(sorted_rms) * 0.60) - 1)]
+    threshold = max(1, int(max_rms * 0.08), int(noise_floor * 3.0))
+    active = [start for start, rms in chunks if rms >= threshold]
+    if not active:
+        return source
+
+    trim_start = max(0, active[0] - pre_roll_ms)
+    trim_end = min(len(source), active[-1] + chunk_ms + tail_ms)
+    trimmed_len = trim_end - trim_start
+    min_trimmed_len = max(HEARTBEAT_LOOP_CROSSFADE_MS * 2, 250)
+
+    if trimmed_len <= min_trimmed_len:
+        logger.info(
+            f"[mix] Loop trim skipped: source too short after trim ({trimmed_len}ms <= {min_trimmed_len}ms)"
+        )
+        return source
+
+    if trim_start == 0 and trim_end == len(source):
+        return source
+
+    logger.info(
+        f"[mix] Loop source trimmed: {len(source)}ms -> {trimmed_len}ms "
+        f"(start={trim_start}ms, end={trim_end}ms, rms_threshold={threshold})"
+    )
+    return source[trim_start:trim_end]
+
+
 def _build_looped_heartbeat_bed(
     source_path: str,
     output_path: str,
@@ -875,7 +968,7 @@ def _build_looped_heartbeat_bed(
     intro_silence_ms: int = HEARTBEAT_LOOP_INTRO_SILENCE_MS,
     intro_ramp_ms: int = HEARTBEAT_LOOP_INTRO_RAMP_MS,
 ) -> bool:
-    """Render a finite heartbeat bed with a one-time intro and seamless joins."""
+    """Render a finite heartbeat bed with one-time intro and crossfaded loop joins."""
     try:
         source = AudioSegment.from_file(source_path, format='wav')
     except Exception as e:
@@ -889,22 +982,28 @@ def _build_looped_heartbeat_bed(
     intro_silence_ms = max(0, int(intro_silence_ms))
     intro_ramp_ms = max(0, int(intro_ramp_ms))
 
+    source = _trim_heartbeat_loop_source(source)
+    crossfade_ms = max(0, min(int(crossfade_ms), len(source) // 4, 250))
+
     bed = AudioSegment.silent(duration=intro_silence_ms)
     first_segment = source.fade_in(intro_ramp_ms) if intro_ramp_ms > 0 else source
     bed += first_segment
 
     target_ms = max(int(target_duration_s * 1000.0), len(bed))
-    safety_limit_ms = max(target_ms + len(source), target_ms * 3)
+    remaining_ms = target_ms - len(bed)
+    if remaining_ms > 0:
+        loop_block = source
+        target_block_ms = remaining_ms + crossfade_ms
+        while len(loop_block) < target_block_ms:
+            if crossfade_ms > 0 and len(loop_block) > crossfade_ms:
+                loop_block = loop_block.append(loop_block, crossfade=crossfade_ms)
+            else:
+                loop_block += loop_block
 
-    while len(bed) < target_ms:
-        if crossfade_ms > 0 and len(source) > crossfade_ms:
-            bed = bed.append(source, crossfade=crossfade_ms)
+        if crossfade_ms > 0 and len(loop_block) > crossfade_ms:
+            bed = bed.append(loop_block, crossfade=crossfade_ms)
         else:
-            bed += source
-
-        if len(bed) > safety_limit_ms:
-            logger.warning(f"[mix] Loop bed generation exceeded safety limit for '{source_path}'")
-            break
+            bed += loop_block
 
     if len(bed) > target_ms + crossfade_ms:
         bed = bed[:target_ms]
@@ -954,17 +1053,16 @@ def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
             logger.info(f"[preprocess_shared] Cache hit for normalized asset: {os.path.basename(cached_asset)}")
             shutil.copy2(cached_asset, normalized_asset_path)
             asset_volume = fast_mean_volume(normalized_asset_path)
-            # Still need to convert heartbeat (different context)
-            if not _ffmpeg_convert_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono):
+            heartbeat_ready = _restore_cached_heartbeat_variants(
+                picked_audio,
+                picked_wav_stereo,
+                picked_wav_mono,
+            )
+            if not heartbeat_ready and not _ffmpeg_convert_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono):
                 logger.error(f"[preprocess_shared] Cannot decode heartbeat upload '{picked_audio}'")
                 return {'success': False, 'error': 'heartbeat-decode-failed'}
-            # Cache heartbeat stereo & mono
-            if os.path.exists(picked_audio):
-                hb_cache_key_stereo = _get_cache_key(picked_audio, "hb-stereo")
-                hb_cache_key_mono = _get_cache_key(picked_audio, "hb-mono")
-                _save_to_cache(hb_cache_key_stereo, picked_wav_stereo)
-                _save_to_cache(hb_cache_key_mono, picked_wav_mono)
-                logger.info(f"[preprocess_shared] Cached heartbeat stereo & mono")
+            if not heartbeat_ready:
+                _cache_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono)
             logger.info(f"[preprocess_shared] Done (from cache). asset_vol={asset_volume:.1f}dB")
             return {
                 'success': True,
@@ -995,17 +1093,17 @@ def preprocess_shared(asset_audio: str, picked_audio: str, work_dir: str):
         logger.info(f"[preprocess_shared] Saved normalized asset to cache")
 
     # 3) Convert picked → WAV stereo và mono, có fallback demuxer.
-    if not _ffmpeg_convert_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono):
+    heartbeat_ready = _restore_cached_heartbeat_variants(
+        picked_audio,
+        picked_wav_stereo,
+        picked_wav_mono,
+    )
+    if not heartbeat_ready and not _ffmpeg_convert_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono):
         logger.error(f"[preprocess_shared] Cannot decode heartbeat upload '{picked_audio}'")
         return {'success': False, 'error': 'heartbeat-decode-failed'}
 
-    # Cache heartbeat stereo & mono
-    if os.path.exists(picked_audio):
-        hb_cache_key_stereo = _get_cache_key(picked_audio, "hb-stereo")
-        hb_cache_key_mono = _get_cache_key(picked_audio, "hb-mono")
-        _save_to_cache(hb_cache_key_stereo, picked_wav_stereo)
-        _save_to_cache(hb_cache_key_mono, picked_wav_mono)
-        logger.info(f"[preprocess_shared] Cached heartbeat stereo & mono")
+    if not heartbeat_ready:
+        _cache_heartbeat_variants(picked_audio, picked_wav_stereo, picked_wav_mono)
 
     # 4) Đo volume asset bằng numpy (0 subprocess)
     asset_volume = fast_mean_volume(normalized_asset_path)
@@ -1682,6 +1780,8 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             'fade_out_start': fade_out_start,
             'bpm_mode': bpm_mode,
             'use_loop_bed': loop_bed_ready,
+            'asset_weight': bpm_plan.get('asset_weight', 1.0 - STANDARD_HEARTBEAT_WEIGHT),
+            'heart_weight': bpm_plan.get('heart_weight', STANDARD_HEARTBEAT_WEIGHT),
             'heart_len_s': heart_len_s,
             'sr': sr,
             'lowpass_f': 420 if bpm_mode == "ambient-texture" else 350,
@@ -1721,10 +1821,21 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         # Nếu loop_bed_ready=True VÀ primary_mix_ok: fade + 432Hz đã nằm trong filter chain
         if loop_bed_ready and primary_mix_ok:
             if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
-                import shutil
-                shutil.copy2(mixed_temp_path, output_path)
-                logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
-                return
+                is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
+                    mixed_temp_path,
+                    expected_asset_duration=asset_dur_s,
+                )
+                logger.info(
+                    f"[mix] Loop bed health check: ok={is_healthy}, reason={health_reason}, "
+                    f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
+                )
+                if is_healthy:
+                    import shutil
+                    shutil.copy2(mixed_temp_path, output_path)
+                    logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
+                    return
+                logger.warning(f"[mix] Loop bed primary output unhealthy ({health_reason}), retrying fallback")
+                primary_mix_ok = False
             else:
                 raise RuntimeError("[mix] loop_bed_ready but mixed_temp_path missing/empty, cannot create output")
 
@@ -1760,7 +1871,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             fallback_mix_filter = (
                 f"{asset_filter}{fallback_picked_filter}"
                 f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
-                f":weights=0.45 0.55,"
+                f":weights={mix_params['asset_weight']:.3f} {mix_params['heart_weight']:.3f},"
                 f"alimiter=limit=0.9"
                 f"[a]"
             )
@@ -1779,6 +1890,16 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         # Skip health check and fade+432Hz section
         if loop_bed_ready:
             if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
+                is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
+                    mixed_temp_path,
+                    expected_asset_duration=asset_dur_s,
+                )
+                logger.info(
+                    f"[mix] Loop bed fallback health check: ok={is_healthy}, reason={health_reason}, "
+                    f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
+                )
+                if not is_healthy:
+                    raise RuntimeError(f"[mix] Loop bed output unhealthy: {health_reason}")
                 import shutil
                 shutil.copy2(mixed_temp_path, output_path)
                 logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
@@ -1810,7 +1931,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                     f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
                     f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
                     f"[a1];"
-                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights=0.45 0.55,"
+                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights={mix_params['asset_weight']:.3f} {mix_params['heart_weight']:.3f},"
                     f"alimiter=limit=0.92"
                     f"[a]"
                 )
@@ -1827,7 +1948,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                     f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
                     f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
                     f"[a1];"
-                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights=0.45 0.55,"
+                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights={mix_params['asset_weight']:.3f} {mix_params['heart_weight']:.3f},"
                     f"alimiter=limit=0.92"
                     f"[a]"
                 )
@@ -1858,6 +1979,16 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         # → copy mixed_temp_path to output_path and return
         if loop_bed_ready:
             if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
+                is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
+                    mixed_temp_path,
+                    expected_asset_duration=asset_dur_s,
+                )
+                logger.info(
+                    f"[mix] Loop bed final health check: ok={is_healthy}, reason={health_reason}, "
+                    f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
+                )
+                if not is_healthy:
+                    raise RuntimeError(f"[mix] Loop bed output unhealthy after all attempts: {health_reason}")
                 import shutil
                 shutil.copy2(mixed_temp_path, output_path)
                 logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
