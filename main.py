@@ -337,6 +337,14 @@ def is_ghost_heartbeat_track(track_name: str, display_name: str) -> bool:
     if normalized_track.endswith("_hb.wav") and normalized_display in {"hb.wav", "hb"}:
         return True
 
+    generated_heartbeat_patterns = (
+        r"^heartbeat-guest-.+\.[a-z0-9]+$",
+        r"^heartbeat-[a-f0-9]{24,}(?:-[a-f0-9]{16,})*\.[a-z0-9]+$",
+    )
+    for pattern in generated_heartbeat_patterns:
+        if re.match(pattern, normalized_track) or re.match(pattern, normalized_display):
+            return True
+
     return False
 
 
@@ -410,7 +418,7 @@ def build_uploaded_track_name(original_name: str, file_type: str, content_type: 
     safe_name = os.path.basename((original_name or "").strip())
     stem, ext = os.path.splitext(safe_name)
     # Làm sạch stem: chỉ giữ ký tự an toàn
-    safe_stem = "".join([c for c in stem if c.isalnum() or c in "._-"]).strip("._-")
+    safe_stem = "".join([c for c in stem if c.isalnum() or c in " ._-"]).strip(" ._-")
     if not safe_stem:
         safe_stem = normalized_type  # Fallback dùng chính file_type
 
@@ -420,7 +428,7 @@ def build_uploaded_track_name(original_name: str, file_type: str, content_type: 
         guessed_ext = (mimetypes.guess_extension(content_type or "") or "").lower()
         ext = guessed_ext if guessed_ext in ALLOWED_TRACK_EXTENSIONS else ".wav"
 
-    return f"upload_{normalized_type}_{safe_stem[:80]}{ext}"
+    return f"{safe_stem[:80]}{ext}"
 
 
 def upload_track_file_to_r2(
@@ -461,7 +469,7 @@ def upload_track_file_to_r2(
 
     # Tạo tên object chuẩn hoá (tránh trùng lặp)
     object_name = build_uploaded_track_name(original_name, normalized_type, content_type)
-    safe_original = "".join([c for c in os.path.basename(original_name or "") if c.isalnum() or c in "._-"])
+    safe_original = "".join([c for c in os.path.basename(original_name or "") if c.isalnum() or c in " ._-"]).strip()
     if not safe_original:
         safe_original = "upload"
 
@@ -496,6 +504,7 @@ def upload_track_file_to_r2(
         normalized_type,
         os.path.getsize(local_path),
     )
+    _invalidate_tracks_cache()
     return object_name
 
 
