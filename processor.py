@@ -325,14 +325,12 @@ HEARTBEAT_INPUT_STRATEGIES = [
     ("mp3", "-f mp3"),
 ]
 
-MAX_BPM_STRETCH = 0.15
+MAX_BPM_STRETCH = 0.10
 AMBIENT_TRACK_BPM_THRESHOLD = 60.0
-AMBIENT_SYNC_DEVIATION_THRESHOLD = 0.34
 BPM_SYNC_APPLY_EPS = 0.02
+BPM_SYNC_RATIO_TOLERANCE = 0.10
 AMBIENT_HEARTBEAT_WEIGHT = 0.30
 STANDARD_HEARTBEAT_WEIGHT = 0.55
-MEET_IN_MIDDLE_MAX_STRETCH = 0.15
-BIDIRECTIONAL_SYNC_RATIO_THRESHOLD = 0.08
 AFFTDN_NF_MIN_DB = -80.0
 AFFTDN_NF_MAX_DB = -20.0  # FFmpeg afftdn nf valid range is [-80, -20]
 STANDARD_AFFTDN_NF_DB = -20.0
@@ -501,32 +499,34 @@ def _normalize_music_tempo_for_sync(music_tempo: float, heart_tempo: float) -> t
 
 
 def _plan_bpm_sync_adjustments(heart_tempo: float, music_tempo: float, max_stretch: float = MAX_BPM_STRETCH):
-    """Pick a BPM sync plan with bidirectional meet-in-the-middle for large gaps.
+    """Pick a conservative BPM sync plan.
 
-    - Small gap (<=8%): light-sync -- only heartbeat stretched, max +/-15%
-    - Large gap (>8%): meet-in-middle -- both sides move toward geometric midpoint,
-      each capped at MEET_IN_MIDDLE_MAX_STRETCH (15%)
-    - Ambient/low-BPM: no stretch, reduce heartbeat prominence instead
+    - 1:1 and octave-equivalent 2:1 ratios are normalized before comparison.
+    - Accept close ratios as-is so the heartbeat stays natural.
+    - For larger gaps, stretch only the background track, capped at +/-10%.
+    - Ambient/low-BPM: no stretch, reduce heartbeat prominence instead.
     """
     heart_tempo = float(heart_tempo or 120.0)
     music_tempo = float(music_tempo or 120.0)
 
     normalized_music_tempo, music_octave_shift = _normalize_music_tempo_for_sync(music_tempo, heart_tempo)
     exact_ratio = normalized_music_tempo / max(heart_tempo, 1e-9)
-    ratio_deviation = abs(math.log(max(exact_ratio, 1e-9)))
-    ambient_mode = normalized_music_tempo <= AMBIENT_TRACK_BPM_THRESHOLD or ratio_deviation >= AMBIENT_SYNC_DEVIATION_THRESHOLD
+    ambient_mode = normalized_music_tempo <= AMBIENT_TRACK_BPM_THRESHOLD
 
     base_plan = {
+        "raw_music_tempo": music_tempo,
         "music_tempo": normalized_music_tempo,
         "music_octave_shift": music_octave_shift,
         "heart_rate": 1.0,
         "asset_rate": 1.0,
+        "asset_rate_requested": 1.0,
         "adjusted_heart_tempo": heart_tempo,
-        "adjusted_music_tempo": music_tempo,
+        "adjusted_raw_music_tempo": music_tempo,
+        "adjusted_music_tempo": normalized_music_tempo,
         "residual_ratio": exact_ratio,
         "exact_ratio": exact_ratio,
-        "policy_mode": "ambient-texture" if ambient_mode else "light-sync",
-        "heart_limit": 0.0 if ambient_mode else max_stretch,
+        "policy_mode": "ambient-texture" if ambient_mode else "natural-ratio",
+        "heart_limit": 0.0,
         "asset_limit": 0.0,
         "heart_weight": AMBIENT_HEARTBEAT_WEIGHT if ambient_mode else STANDARD_HEARTBEAT_WEIGHT,
         "asset_weight": 1.0 - (AMBIENT_HEARTBEAT_WEIGHT if ambient_mode else STANDARD_HEARTBEAT_WEIGHT),
@@ -551,40 +551,30 @@ def _plan_bpm_sync_adjustments(heart_tempo: float, music_tempo: float, max_stret
 
     ratio_gap = abs(1.0 - exact_ratio)
 
-    # --- Bidirectional "meet in the middle" for large gaps ---
-    if ratio_gap > BIDIRECTIONAL_SYNC_RATIO_THRESHOLD:
-        target_ratio = math.sqrt(exact_ratio)
-
-        heart_rate = _clamp_tempo_rate(target_ratio, MEET_IN_MIDDLE_MAX_STRETCH)
-        asset_rate = _clamp_tempo_rate(1.0 / target_ratio, MEET_IN_MIDDLE_MAX_STRETCH)
-
-        adjusted_heart = heart_tempo * heart_rate
-        adjusted_music = music_tempo * asset_rate
-
+    if ratio_gap <= BPM_SYNC_RATIO_TOLERANCE + 1e-9:
         return {
             **base_plan,
-            "heart_rate": heart_rate,
-            "asset_rate": asset_rate,
-            "adjusted_heart_tempo": adjusted_heart,
-            "adjusted_music_tempo": adjusted_music,
-            "residual_ratio": adjusted_music / max(adjusted_heart, 1e-9),
-            "policy_mode": "meet-in-middle",
-            "heart_limit": MEET_IN_MIDDLE_MAX_STRETCH,
-            "asset_limit": MEET_IN_MIDDLE_MAX_STRETCH,
+            "policy_mode": "natural-ratio",
+            "heart_limit": 0.0,
+            "asset_limit": 0.0,
             "heart_weight": STANDARD_HEARTBEAT_WEIGHT,
             "asset_weight": 1.0 - STANDARD_HEARTBEAT_WEIGHT,
         }
 
-    # --- Original light-sync for small gaps ---
-    heart_rate = _clamp_tempo_rate(exact_ratio, max_stretch=max_stretch)
+    requested_asset_rate = 1.0 / exact_ratio
+    asset_rate = _clamp_tempo_rate(requested_asset_rate, max_stretch=max_stretch)
+    adjusted_raw_music = music_tempo * asset_rate
+    adjusted_music = normalized_music_tempo * asset_rate
     return {
         **base_plan,
-        "heart_rate": heart_rate,
-        "adjusted_heart_tempo": heart_tempo * heart_rate,
-        "residual_ratio": normalized_music_tempo / max(heart_tempo * heart_rate, 1e-9),
-        "policy_mode": "light-sync",
-        "heart_limit": max_stretch,
-        "asset_limit": 0.0,
+        "asset_rate": asset_rate,
+        "asset_rate_requested": requested_asset_rate,
+        "adjusted_raw_music_tempo": adjusted_raw_music,
+        "adjusted_music_tempo": adjusted_music,
+        "residual_ratio": adjusted_music / max(heart_tempo, 1e-9),
+        "policy_mode": "track-sync",
+        "heart_limit": 0.0,
+        "asset_limit": max_stretch,
         "heart_weight": STANDARD_HEARTBEAT_WEIGHT,
         "asset_weight": 1.0 - STANDARD_HEARTBEAT_WEIGHT,
     }
@@ -960,6 +950,19 @@ def _trim_heartbeat_loop_source(
     return source[trim_start:trim_end]
 
 
+def _append_loop_crossfade(base: AudioSegment, segment: AudioSegment, crossfade_ms: int) -> AudioSegment:
+    """Append a loop segment using overlap crossfade, falling back only when segments are too short."""
+    crossfade_ms = max(0, int(crossfade_ms))
+    if crossfade_ms <= 0:
+        return base + segment
+
+    safe_crossfade_ms = min(crossfade_ms, len(base) // 2, len(segment) // 2)
+    if safe_crossfade_ms <= 0:
+        return base + segment
+
+    return base.append(segment, crossfade=safe_crossfade_ms)
+
+
 def _build_looped_heartbeat_bed(
     source_path: str,
     output_path: str,
@@ -990,20 +993,19 @@ def _build_looped_heartbeat_bed(
     bed += first_segment
 
     target_ms = max(int(target_duration_s * 1000.0), len(bed))
+    logger.info(
+        f"[mix] Loop bed crossfade config: source={len(source)}ms, target={target_ms}ms, "
+        f"crossfade={crossfade_ms}ms, intro_silence={intro_silence_ms}ms, "
+        f"first_loop_ramp={intro_ramp_ms}ms"
+    )
     remaining_ms = target_ms - len(bed)
     if remaining_ms > 0:
         loop_block = source
         target_block_ms = remaining_ms + crossfade_ms
         while len(loop_block) < target_block_ms:
-            if crossfade_ms > 0 and len(loop_block) > crossfade_ms:
-                loop_block = loop_block.append(loop_block, crossfade=crossfade_ms)
-            else:
-                loop_block += loop_block
+            loop_block = _append_loop_crossfade(loop_block, loop_block, crossfade_ms)
 
-        if crossfade_ms > 0 and len(loop_block) > crossfade_ms:
-            bed = bed.append(loop_block, crossfade=crossfade_ms)
-        else:
-            bed += loop_block
+        bed = _append_loop_crossfade(bed, loop_block, crossfade_ms)
 
     if len(bed) > target_ms + crossfade_ms:
         bed = bed[:target_ms]
@@ -1682,13 +1684,26 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         bpm_mode = bpm_plan.get("policy_mode", "light-sync")
 
         asset_rate = bpm_plan.get("asset_rate", 1.0)
+        requested_asset_rate = bpm_plan.get("asset_rate_requested", asset_rate)
+        asset_limit = bpm_plan.get("asset_limit", MAX_BPM_STRETCH)
+        asset_rate_was_clamped = abs(requested_asset_rate - asset_rate) > 1e-6
         logger.info(
             f"[mix] BPM sync plan: policy={bpm_plan.get('policy_mode', 'standard')}, "
-            f"heart_stretch={tempo_rate:.3f}, asset_stretch={asset_rate:.3f}"
+            f"heart_stretch={tempo_rate:.3f}, asset_stretch={asset_rate:.3f}, "
+            f"asset_requested={requested_asset_rate:.3f}, asset_limit=+/-{asset_limit * 100:.0f}%, "
+            f"asset_clamped={asset_rate_was_clamped}"
         )
         logger.info(
-            f"[mix] BPM values: heartbeat_raw={heart_tempo:.1f} -> heartbeat_adjusted={bpm_plan['adjusted_heart_tempo']:.1f}, "
-            f"track_raw={music_tempo:.1f}, track_adjusted={bpm_plan['adjusted_music_tempo']:.1f}"
+            f"[mix] BPM normalize: heartbeat_raw={heart_tempo:.1f}, "
+            f"track_raw={music_tempo:.1f}, track_norm={bpm_plan['music_tempo']:.1f}, "
+            f"track_octave_shift={bpm_plan['music_octave_shift']:+d}, "
+            f"ratio_before={bpm_plan['exact_ratio']:.3f}"
+        )
+        logger.info(
+            f"[mix] BPM after stretch: heartbeat_raw={heart_tempo:.1f}->{bpm_plan['adjusted_heart_tempo']:.1f}, "
+            f"track_raw={music_tempo:.1f}->{bpm_plan['adjusted_raw_music_tempo']:.1f}, "
+            f"track_norm={bpm_plan['music_tempo']:.1f}->{bpm_plan['adjusted_music_tempo']:.1f}, "
+            f"residual_ratio={bpm_plan['residual_ratio']:.3f}"
         )
 
         if abs(tempo_rate - 1.0) > BPM_SYNC_APPLY_EPS:
@@ -1702,7 +1717,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             logger.info(f"[mix] rate≈1.0 → skip stretch")
             stretched_path = stable_path
 
-        # ── 4.5. Stretch asset tempo for bidirectional sync ─────────────
+        # ── 4.5. Stretch asset tempo for conservative track-only sync ─────────────
         if abs(asset_rate - 1.0) > BPM_SYNC_APPLY_EPS:
             stretched_asset_for_mix = os.path.join(temp_dir, 'asset_stretched.wav')
             atempo_asset_str = get_atempo_filter(asset_rate)
@@ -1710,7 +1725,11 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                 f'ffmpeg -y -i "{normalized_asset_path}" '
                 f'-filter:a "{atempo_asset_str}" "{stretched_asset_for_mix}"'
             ):
-                logger.info(f"[mix] Asset tempo stretched: rate={asset_rate:.3f}")
+                logger.info(
+                    f"[mix] Asset tempo stretched: rate={asset_rate:.3f}, "
+                    f"raw_bpm={music_tempo:.1f}->{bpm_plan['adjusted_raw_music_tempo']:.1f}, "
+                    f"normalized_bpm={bpm_plan['music_tempo']:.1f}->{bpm_plan['adjusted_music_tempo']:.1f}"
+                )
             else:
                 logger.warning("[mix] Asset atempo stretch failed, using original asset")
                 stretched_asset_for_mix = normalized_asset_path
