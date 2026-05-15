@@ -502,15 +502,17 @@ def _plan_bpm_sync_adjustments(heart_tempo: float, music_tempo: float, max_stret
     """Pick a conservative BPM sync plan.
 
     - 1:1 and octave-equivalent 2:1 ratios are normalized before comparison.
-    - Accept close ratios as-is so the heartbeat stays natural.
-    - For larger gaps, stretch only the background track, capped at +/-10%.
     - Ambient/low-BPM: no stretch, reduce heartbeat prominence instead.
+    - Close ratios are synced by stretching only the background track.
+    - Larger gaps are left unsynced to avoid audible track warping.
+    - Heartbeat tempo is never stretched so it stays natural.
     """
     heart_tempo = float(heart_tempo or 120.0)
     music_tempo = float(music_tempo or 120.0)
 
     normalized_music_tempo, music_octave_shift = _normalize_music_tempo_for_sync(music_tempo, heart_tempo)
     exact_ratio = normalized_music_tempo / max(heart_tempo, 1e-9)
+    ratio_gap = abs(1.0 - exact_ratio)
     ambient_mode = normalized_music_tempo <= AMBIENT_TRACK_BPM_THRESHOLD
 
     base_plan = {
@@ -535,6 +537,16 @@ def _plan_bpm_sync_adjustments(heart_tempo: float, music_tempo: float, max_stret
     if heart_tempo <= 0 or music_tempo <= 0:
         return base_plan
 
+    if ratio_gap <= BPM_SYNC_APPLY_EPS:
+        return {
+            **base_plan,
+            "policy_mode": "natural-ratio",
+            "heart_limit": 0.0,
+            "asset_limit": 0.0,
+            "heart_weight": STANDARD_HEARTBEAT_WEIGHT,
+            "asset_weight": 1.0 - STANDARD_HEARTBEAT_WEIGHT,
+        }
+
     if ambient_mode:
         return {
             **base_plan,
@@ -549,32 +561,30 @@ def _plan_bpm_sync_adjustments(heart_tempo: float, music_tempo: float, max_stret
             "asset_weight": 1.0 - AMBIENT_HEARTBEAT_WEIGHT,
         }
 
-    ratio_gap = abs(1.0 - exact_ratio)
-
     if ratio_gap <= BPM_SYNC_RATIO_TOLERANCE + 1e-9:
+        requested_asset_rate = 1.0 / exact_ratio
+        asset_rate = _clamp_tempo_rate(requested_asset_rate, max_stretch=max_stretch)
+        adjusted_raw_music = music_tempo * asset_rate
+        adjusted_music = normalized_music_tempo * asset_rate
         return {
             **base_plan,
-            "policy_mode": "natural-ratio",
+            "asset_rate": asset_rate,
+            "asset_rate_requested": requested_asset_rate,
+            "adjusted_raw_music_tempo": adjusted_raw_music,
+            "adjusted_music_tempo": adjusted_music,
+            "residual_ratio": adjusted_music / max(heart_tempo, 1e-9),
+            "policy_mode": "track-sync",
             "heart_limit": 0.0,
-            "asset_limit": 0.0,
+            "asset_limit": max_stretch,
             "heart_weight": STANDARD_HEARTBEAT_WEIGHT,
             "asset_weight": 1.0 - STANDARD_HEARTBEAT_WEIGHT,
         }
 
-    requested_asset_rate = 1.0 / exact_ratio
-    asset_rate = _clamp_tempo_rate(requested_asset_rate, max_stretch=max_stretch)
-    adjusted_raw_music = music_tempo * asset_rate
-    adjusted_music = normalized_music_tempo * asset_rate
     return {
         **base_plan,
-        "asset_rate": asset_rate,
-        "asset_rate_requested": requested_asset_rate,
-        "adjusted_raw_music_tempo": adjusted_raw_music,
-        "adjusted_music_tempo": adjusted_music,
-        "residual_ratio": adjusted_music / max(heart_tempo, 1e-9),
-        "policy_mode": "track-sync",
+        "policy_mode": "no-sync",
         "heart_limit": 0.0,
-        "asset_limit": max_stretch,
+        "asset_limit": 0.0,
         "heart_weight": STANDARD_HEARTBEAT_WEIGHT,
         "asset_weight": 1.0 - STANDARD_HEARTBEAT_WEIGHT,
     }
@@ -1548,13 +1558,13 @@ def _extract_windowed_segment(y: np.ndarray, sr: int,
 
 
 def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, heart_tempo=None, music_tempo=None, shared_data=None):
-    """Version duy nhất: HPSS denoising + BPM sync (±15%) + 432Hz + 4s intro heartbeat + fade in/out.
+    """Single mix pipeline: HPSS denoising + track-only BPM sync + 432Hz + intro + fade in/out.
 
     Pipeline:
     1. Shared preprocessing (preconvert + loudnorm asset, convert picked mono)
     2. HPSS → tách percussive component (nhịp tim sạch)
     3. Tìm đoạn heartbeat ổn định nhất ~10s (extract_stable_heartbeat_segment)
-    4. BPM sync: chỉ thay đổi heartbeat tempo tối đa ±15%, nếu delta > 15% giữ nguyên
+    4. BPM sync: normalize track BPM by octave, stretch only the track when gap <= 10%
     5. 4 giây đầu chỉ có heartbeat (adelay nhạc nền)
     6. Mix với nhạc nền → amix duration=first
     7b. Fade-in 4s / Fade-out 4s trên finite mixed file (KHÔNG dùng afade trong filter_complex
@@ -1675,12 +1685,11 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         stable_dur = len(y_stable) / sr
         logger.info(f"[mix] Stable segment extracted: {stable_dur:.1f}s → {stable_path}")
  
-        # ── 4. BPM sync: thử nhiều phương án trong biên ±15% rồi chọn phương án nghe tự nhiên nhất
+        # -- 4. BPM sync: octave-normalize track tempo, then stretch track only when gap <= 10%.
         heart_tempo = max(40.0, min(180.0, heart_tempo))
         music_tempo = max(50.0, min(220.0, music_tempo))
 
         bpm_plan = _plan_bpm_sync_adjustments(heart_tempo, music_tempo)
-        tempo_rate = bpm_plan["heart_rate"]
         bpm_mode = bpm_plan.get("policy_mode", "light-sync")
 
         asset_rate = bpm_plan.get("asset_rate", 1.0)
@@ -1689,7 +1698,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         asset_rate_was_clamped = abs(requested_asset_rate - asset_rate) > 1e-6
         logger.info(
             f"[mix] BPM sync plan: policy={bpm_plan.get('policy_mode', 'standard')}, "
-            f"heart_stretch={tempo_rate:.3f}, asset_stretch={asset_rate:.3f}, "
+            f"heart_stretch=1.000, asset_stretch={asset_rate:.3f}, "
             f"asset_requested={requested_asset_rate:.3f}, asset_limit=+/-{asset_limit * 100:.0f}%, "
             f"asset_clamped={asset_rate_was_clamped}"
         )
@@ -1706,16 +1715,8 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             f"residual_ratio={bpm_plan['residual_ratio']:.3f}"
         )
 
-        if abs(tempo_rate - 1.0) > BPM_SYNC_APPLY_EPS:
-            atempo_str = get_atempo_filter(tempo_rate)
-            if not run_ffmpeg(
-                f'ffmpeg -y -i "{stable_path}" -filter:a "{atempo_str}" "{stretched_path}"'
-            ):
-                logger.warning("[mix] atempo stretch failed, using original stable segment")
-                stretched_path = stable_path
-        else:
-            logger.info(f"[mix] rate≈1.0 → skip stretch")
-            stretched_path = stable_path
+        logger.info("[mix] Heartbeat tempo is preserved; skipping heartbeat atempo stretch")
+        stretched_path = stable_path
 
         # ── 4.5. Stretch asset tempo for conservative track-only sync ─────────────
         if abs(asset_rate - 1.0) > BPM_SYNC_APPLY_EPS:
