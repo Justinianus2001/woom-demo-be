@@ -16,6 +16,241 @@ import hashlib
 import functools
 from pathlib import Path
 
+
+# ─── DSP HELPERS (Smart AI Mastering) ───────────────────────────────────────────
+def normalize_rms(signal_arr: np.ndarray, target_db: float) -> np.ndarray:
+    rms = np.sqrt(np.mean(signal_arr**2))
+    if rms < 1e-9:
+        return signal_arr
+    current_db = 20 * np.log10(rms)
+    gain_db = target_db - current_db
+    gain_linear = 10 ** (gain_db / 20.0)
+    return signal_arr * gain_linear
+
+def low_pass_filter(audio: np.ndarray, sr: int, cutoff_hz: float, order: int = 4) -> np.ndarray:
+    sos = signal.butter(order, cutoff_hz, btype='low', fs=sr, output='sos')
+    if audio.ndim == 1:
+        return signal.sosfilt(sos, audio).astype(np.float32)
+    return np.stack([signal.sosfilt(sos, ch).astype(np.float32) for ch in audio], axis=0)
+
+def smart_peak_limiter(signal_arr: np.ndarray, ceiling_db: float = -0.1) -> np.ndarray:
+    ceil_lin = 10 ** (ceiling_db / 20.0)
+    over = np.abs(signal_arr) / ceil_lin
+    mask = over > 0.9  
+    out = signal_arr.copy()
+    out[mask] = np.sign(signal_arr[mask]) * ceil_lin * (0.9 + 0.1 * np.tanh((over[mask] - 0.9) / 0.1))
+    return out
+
+def find_best_window(y: np.ndarray, sr: int):
+    win_size     = int(3.0 * sr)
+    step         = int(0.05 * sr)
+    boundary_ms  = 150                          
+    bnd_size     = max(1, int(boundary_ms * sr / 1000))
+    best_start   = 0
+    best_score   = -1.0
+    best_stats   = {}
+
+    global_max = np.max(np.abs(y)) if len(y) > 0 else 1.0
+    threshold  = 0.05 * global_max
+
+    for start in range(0, len(y) - win_size, step):
+        end      = start + win_size
+        window_y = y[start:end]
+
+        mean_abs  = float(np.mean(np.abs(window_y)))
+        chunks    = np.array_split(window_y, 6)
+        chunk_rms = [float(np.sqrt(np.mean(c**2))) for c in chunks]
+        mean_rms  = float(np.mean(chunk_rms))
+        std_rms   = float(np.std(chunk_rms))
+
+        if mean_rms < 1e-5:
+            continue
+
+        cv           = std_rms / mean_rms
+        stability    = 1.0 / (cv + 0.05)
+        active_ratio = float(np.mean(np.abs(window_y) > threshold))
+
+        rms_head = float(np.sqrt(np.mean(window_y[:bnd_size] ** 2)))
+        rms_tail = float(np.sqrt(np.mean(window_y[-bnd_size:] ** 2)))
+        head_ratio = rms_head / (mean_rms + 1e-9)
+        tail_ratio = rms_tail / (mean_rms + 1e-9)
+        boundary_factor = 1.0 / (1.0 + head_ratio ** 2 + tail_ratio ** 2)
+        boundary_factor *= 4.0
+
+        score = mean_abs * stability * active_ratio * boundary_factor
+
+        if score > best_score:
+            best_score = score
+            best_start = start
+            best_stats = {
+                "mean_amplitude":   mean_abs,
+                "energy_cv":        cv,
+                "active_ratio":     active_ratio,
+                "boundary_factor":  boundary_factor,
+                "rms_head_ratio":   head_ratio,
+                "rms_tail_ratio":   tail_ratio,
+            }
+
+    if best_score < 0:
+        best_start = 0
+        best_stats = {"fallback": True}
+
+    return best_start, best_start + int(3.0 * sr), best_stats
+
+def snap_to_zero_crossing(y: np.ndarray, sr: int, target: int, search_ms: int = 5, min_idx: int = 0, max_idx: int = None) -> int:
+    radius = int(search_ms * sr / 1000)
+    if max_idx is None:
+        max_idx = len(y) - 1
+
+    lo = max(min_idx, target - radius)
+    hi = min(max_idx, target + radius)
+
+    if hi <= lo: return target
+    window = y[lo:hi]
+    if len(window) >= 2:
+        zc = np.where((window[:-1] <= 0) & (window[1:] > 0))[0]
+        if len(zc) > 0:
+            target_in_win = target - lo
+            best_zc = zc[np.argmin(np.abs(zc - target_in_win))]
+            return lo + int(best_zc)
+    return target
+
+def extract_continuous_stable_3s(y: np.ndarray, sr: int):
+    orig_start, orig_end, stats = find_best_window(y, sr)
+    smooth_win = max(1, int(0.04 * sr))
+    envelope   = np.sqrt(np.convolve(y**2, np.ones(smooth_win) / smooth_win, mode='same'))
+
+    def find_snap_point(target, radius_ms=500):
+        radius = int((radius_ms / 1000.0) * sr)
+        lo = max(0, target - radius)
+        hi = min(len(envelope) - 1, target + radius)
+        if lo >= hi: return target
+        local_env = envelope[lo:hi]
+        max_rms = np.max(envelope)
+        if max_rms == 0: max_rms = 1.0
+        local_env_norm = local_env / max_rms
+        distances_sec = np.abs(np.arange(lo, hi) - target) / sr
+        penalty_per_sec = 0.3
+        cost = local_env_norm + (distances_sec * penalty_per_sec)
+        best_idx = int(np.argmin(cost)) + lo
+        rms_at_best   = envelope[best_idx]
+        rms_at_target = envelope[min(target, len(envelope) - 1)]
+        if rms_at_target > 0 and rms_at_best >= 0.85 * rms_at_target:
+            return target 
+        return best_idx
+
+    s = find_snap_point(orig_start, radius_ms=500)
+    e = find_snap_point(orig_end,   radius_ms=500)
+
+    min_duration = int(1.9 * sr)
+    min_duration = min(min_duration, len(y) - s - int(0.1*sr))
+    min_duration = max(min_duration, int(1.0 * sr)) 
+
+    if e < s + min_duration:
+        e = min(s + min_duration, len(y) - 1)
+
+    s = snap_to_zero_crossing(y, sr, s, search_ms=5)
+    e = snap_to_zero_crossing(y, sr, e, search_ms=5, min_idx=s + min_duration)
+
+    if s >= e or (e - s) < min_duration:
+        e = s + min_duration
+        if s >= e or e > len(y):
+            s, e = orig_start, orig_end
+
+    segment = y[s:e].copy()
+    return segment, s, e, orig_start, orig_end, stats
+
+def create_seamless_loop(y: np.ndarray, sr: int, s: int, e: int, target_duration: float = 30.0, crossfade_ms: float = 80.0) -> np.ndarray:
+    y_cut = y[s:e]
+    seg_len_exact = e - s
+    
+    smooth_win = int(0.04 * sr)
+    rms = np.sqrt(np.convolve(y_cut**2, np.ones(smooth_win) / smooth_win, mode='same'))
+    ac = librosa.autocorrelate(rms)
+    min_lag = int(0.35 * sr) 
+    max_lag = int(2.0 * sr)
+    
+    if len(ac) > max_lag:
+        best_lag = min_lag + np.argmax(ac[min_lag:max_lag])
+        true_beat = best_lag / sr
+        target_len_sec = np.floor((len(y_cut)/sr) / true_beat) * true_beat
+        if target_len_sec >= len(y_cut)/sr:
+            target_len_sec -= true_beat
+        target_samples = int(target_len_sec * sr)
+        zc = np.where((y_cut[:-1] < 0) & (y_cut[1:] >= 0))[0]
+        
+        best_pair = None
+        min_error = float('inf')
+        for z1 in zc:
+            if z1 > 0.5 * sr: continue 
+            expected_z2 = z1 + target_samples
+            if expected_z2 >= len(y_cut): continue
+            idx = np.argmin(np.abs(zc - expected_z2))
+            closest_z2 = zc[idx]
+            error = abs(closest_z2 - expected_z2)
+            if error < min_error:
+                min_error = error
+                best_pair = (z1, closest_z2)
+                
+        if best_pair is not None and min_error < 0.01 * sr:
+            z1, z2 = best_pair
+            segment = y_cut[z1:z2].astype(np.float64).copy()
+            seg_len = len(segment)
+            loop_times = int(round(target_duration * sr / seg_len))
+            if loop_times < 1: loop_times = 1
+            out_len = loop_times * seg_len
+            output = np.zeros(out_len, dtype=np.float64)
+            for i in range(loop_times):
+                pos = i * seg_len
+                output[pos : pos + seg_len] = segment
+            target_samples_out = int(target_duration * sr)
+            if len(output) > target_samples_out:
+                output = output[:target_samples_out]
+            return output.astype(y.dtype)
+
+    fade_len = int((crossfade_ms / 1000.0) * sr)
+    can_borrow = (s >= fade_len)
+    if can_borrow:
+        loop_times = int(round(target_duration * sr / seg_len_exact))
+        if loop_times < 1: loop_times = 1
+        total_samples = loop_times * seg_len_exact
+        output = np.zeros(total_samples, dtype=np.float64)
+        s_expanded = s - fade_len
+        segment = y[s_expanded : e].astype(np.float64).copy()
+        t = np.linspace(0, 1, fade_len, dtype=np.float64)
+        fade_in_env  = t
+        fade_out_env = 1.0 - t
+        pos = 0
+        for i in range(loop_times):
+            seg_win = segment.copy()
+            seg_win[-fade_len:] *= fade_out_env
+            seg_win[:fade_len] *= fade_in_env
+            write_len = len(seg_win)
+            if pos + write_len > total_samples:
+                in_bound = total_samples - pos
+                output[pos:pos+in_bound] += seg_win[:in_bound]
+                overflow = write_len - in_bound
+                output[0:overflow] += seg_win[in_bound:]
+            else:
+                output[pos:pos+write_len] += seg_win
+            pos += seg_len_exact
+        return output.astype(y.dtype)
+    else:
+        segment = y[s:e].astype(np.float64).copy()
+        seg_len = len(segment)
+        loop_times = int(round(target_duration * sr / seg_len))
+        if loop_times < 1: loop_times = 1
+        out_len = loop_times * seg_len
+        output = np.zeros(out_len, dtype=np.float64)
+        for i in range(loop_times):
+            pos = i * seg_len
+            output[pos : pos + seg_len] = segment
+        target_samples_out = int(target_duration * sr)
+        if len(output) > target_samples_out:
+            output = output[:target_samples_out]
+        return output.astype(y.dtype)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _check_lfs_pointer(path: str) -> bool:
     """Check if the file is actually a Git LFS text pointer instead of real audio."""
     try:
@@ -1557,545 +1792,132 @@ def _extract_windowed_segment(y: np.ndarray, sr: int,
     return result
 
 
-def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, heart_tempo=None, music_tempo=None, shared_data=None):
-    """Single mix pipeline: HPSS denoising + track-only BPM sync + 432Hz + intro + fade in/out.
 
-    Pipeline:
-    1. Shared preprocessing (preconvert + loudnorm asset, convert picked mono)
-    2. HPSS → tách percussive component (nhịp tim sạch)
-    3. Tìm đoạn heartbeat ổn định nhất ~10s (extract_stable_heartbeat_segment)
-    4. BPM sync: normalize track BPM by octave, stretch only the track when gap <= 10%
-    5. 4 giây đầu chỉ có heartbeat (adelay nhạc nền)
-    6. Mix với nhạc nền → amix duration=first
-    7b. Fade-in 4s / Fade-out 4s trên finite mixed file (KHÔNG dùng afade trong filter_complex
-        vì aloop=-1 infinite stream → timestamp reset mỗi vòng → afade=t=out không hoạt động)
-    8. 432Hz tuning → Output FLAC
-    """
-    # Log key paths for debugging "Output file not created" issues
+def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, target_bpm=120, heart_duration=None, heart_tempo=None, music_tempo=None, shared_data=None):
+    """Smart AI Mastering DSP Mix Pipeline"""
     output_path = os.path.abspath(output_path)
     logger.info(f"[mix] === START mix_audio_v1 ===")
     logger.info(f"[mix] output_path (absolute): {output_path}")
-    logger.info(f"[mix] output_path exists before start: {os.path.exists(output_path)}")
-    if heart_tempo is None:
-        _, heart_tempo = calculate_duration_from_analysis(picked_audio, num_beats=4)
-    if heart_tempo <= 0:
-        heart_tempo = 120.0
 
-    if music_tempo is None:
-        music_tempo = detect_tempo(asset_audio)
-    if music_tempo <= 0:
-        music_tempo = 120.0
-
-    logger.info(f"[mix] Starting mix_audio: heart={heart_tempo:.0f}BPM, music={music_tempo:.0f}BPM")
+    # Tạo thư mục tạm
     temp_dir_obj = tempfile.TemporaryDirectory()
     temp_dir = temp_dir_obj.name
     try:
-        denoised_path       = os.path.join(temp_dir, 'picked_denoised.wav')
-        stable_path         = os.path.join(temp_dir, 'picked_stable.wav')
-        stretched_path      = os.path.join(temp_dir, 'picked_stretched.wav')
-        normalized_picked_path = os.path.join(temp_dir, 'picked_normalized.wav')
-        mixed_temp_path     = os.path.join(temp_dir, 'mixed_temp.flac')
- 
-        # ── 1. Shared preprocessing (with cache) ──────────────────────────────────
-        use_shared = bool(shared_data and shared_data.get('success'))
-
-        if use_shared:
-            temp_wav_path = shared_data['picked_wav_mono']
-            normalized_asset_path = shared_data['normalized_asset_path']
-            vol_asset = shared_data['asset_volume']
-            if _is_valid_decoded_audio(temp_wav_path):
-                logger.info(f"[mix] Using shared preprocessed data")
-            else:
-                logger.warning("[mix] Shared heartbeat mono file missing/unreadable, fallback local preprocessing")
-                use_shared = False
-
-        if not use_shared:
-            logger.info(f"[mix] No usable shared_data → running local preprocessing")
-            temp_wav_path = os.path.join(temp_dir, 'picked_temp.wav')
-            temp_wav_stereo_path = os.path.join(temp_dir, 'picked_temp_stereo.wav')
-            normalized_asset_path = os.path.join(temp_dir, 'asset_normalized.wav')
-
-            # Check cache for normalized asset
-            use_cache = False
-            if os.path.exists(asset_audio):
-                asset_cache_key = _get_cache_key(asset_audio)
-                logger.debug(f"[cache] Generated key {asset_cache_key} for asset {os.path.basename(asset_audio)}")
-                cached_asset = _check_cache(asset_cache_key)
-                if cached_asset:
-                    logger.info(f"[mix] Cache hit for normalized asset: {os.path.basename(cached_asset)}")
-                    shutil.copy2(cached_asset, normalized_asset_path)
-                    vol_asset = fast_mean_volume(normalized_asset_path)
-                    use_cache = True
-                else:
-                    logger.info(f"[mix] Cache miss for asset {os.path.basename(asset_audio)}")
-
-            if not use_cache:
-                if not _ffmpeg_convert_heartbeat_variants(picked_audio, temp_wav_stereo_path, temp_wav_path):
-                    raise RuntimeError(
-                        "Cannot decode heartbeat upload. Please re-export as PCM WAV, FLAC, or MP3 and try again."
-                    )
-
-                raw_asset_path = os.path.join(temp_dir, 'asset_raw.wav')
-                if not preconvert_asset(asset_audio, raw_asset_path):
-                    raise RuntimeError("Cannot decode background track audio for mixing.")
-
-                if not run_ffmpeg(
-                    f'ffmpeg -y -i "{raw_asset_path}" -ar 44100 -ac 2 '
-                    f'-af loudnorm=I=-16:TP=-1.5:LRA=11 "{normalized_asset_path}"'
-                ):
-                    raise RuntimeError("Failed to normalize background track audio for mixing.")
-
-                # Save to cache and log details
-                if os.path.exists(asset_audio):
-                    asset_cache_key = _get_cache_key(asset_audio)
-                    _save_to_cache(asset_cache_key, normalized_asset_path)
-                    logger.info(f"[mix] Saved normalized asset to cache: {asset_cache_key}")
-
-                vol_asset = fast_mean_volume(normalized_asset_path)
-
-            # DEBUG: Check cache size and eviction
-            try:
-                from pathlib import Path
-                cache_dir = Path(__file__).parent / 'cache'
-                if cache_dir.exists():
-                    total_mb = sum(p.stat().st_size for p in cache_dir.iterdir()) / 1e6
-                    logger.debug(f"[cache] Current cache size: {total_mb:.2f} MB")
-                    if total_mb > 500:
-                        cleanup_old_cache(str(cache_dir), max_size_mb=500)
-            except Exception as e:
-                logger.debug(f"[cache] Cache size check failed: {e}")
-
-        # ── 2. HPSS denoising ────────────────────────────────────────────────
-        y, sr = sf.read(temp_wav_path)
-        if y.ndim > 1:
-            y = np.mean(y, axis=1)
-        logger.info(f"[mix] Audio loaded: {len(y)/sr:.1f}s @ {sr}Hz")
- 
-
-        # Auto-detect input quality
-        quality_info = detect_input_quality(y, sr)
-        logger.info(f"[mix] Auto-detected quality: {quality_info['quality']}")
-
-        y_denoised = apply_noise_reduction(y, sr, quality_info=quality_info)
-        logger.info(f"[mix] HPSS denoising done")
- 
-        # ── 3. Chọn đoạn heartbeat ổn định nhất ~10s ────────────────────────
-        y_stable = extract_stable_heartbeat_segment(y_denoised, sr, target_duration=10.0, quality_info=quality_info)
-        sf.write(stable_path, y_stable, sr)
-        stable_dur = len(y_stable) / sr
-        logger.info(f"[mix] Stable segment extracted: {stable_dur:.1f}s → {stable_path}")
- 
-        # -- 4. BPM sync: octave-normalize track tempo, then stretch track only when gap <= 10%.
-        heart_tempo = max(40.0, min(180.0, heart_tempo))
-        music_tempo = max(50.0, min(220.0, music_tempo))
-
-        bpm_plan = _plan_bpm_sync_adjustments(heart_tempo, music_tempo)
-        bpm_mode = bpm_plan.get("policy_mode", "light-sync")
-
-        asset_rate = bpm_plan.get("asset_rate", 1.0)
-        requested_asset_rate = bpm_plan.get("asset_rate_requested", asset_rate)
-        asset_limit = bpm_plan.get("asset_limit", MAX_BPM_STRETCH)
-        asset_rate_was_clamped = abs(requested_asset_rate - asset_rate) > 1e-6
-        logger.info(
-            f"[mix] BPM sync plan: policy={bpm_plan.get('policy_mode', 'standard')}, "
-            f"heart_stretch=1.000, asset_stretch={asset_rate:.3f}, "
-            f"asset_requested={requested_asset_rate:.3f}, asset_limit=+/-{asset_limit * 100:.0f}%, "
-            f"asset_clamped={asset_rate_was_clamped}"
-        )
-        logger.info(
-            f"[mix] BPM normalize: heartbeat_raw={heart_tempo:.1f}, "
-            f"track_raw={music_tempo:.1f}, track_norm={bpm_plan['music_tempo']:.1f}, "
-            f"track_octave_shift={bpm_plan['music_octave_shift']:+d}, "
-            f"ratio_before={bpm_plan['exact_ratio']:.3f}"
-        )
-        logger.info(
-            f"[mix] BPM after stretch: heartbeat_raw={heart_tempo:.1f}->{bpm_plan['adjusted_heart_tempo']:.1f}, "
-            f"track_raw={music_tempo:.1f}->{bpm_plan['adjusted_raw_music_tempo']:.1f}, "
-            f"track_norm={bpm_plan['music_tempo']:.1f}->{bpm_plan['adjusted_music_tempo']:.1f}, "
-            f"residual_ratio={bpm_plan['residual_ratio']:.3f}"
-        )
-
-        logger.info("[mix] Heartbeat tempo is preserved; skipping heartbeat atempo stretch")
-        stretched_path = stable_path
-
-        # ── 4.5. Stretch asset tempo for conservative track-only sync ─────────────
-        if abs(asset_rate - 1.0) > BPM_SYNC_APPLY_EPS:
-            stretched_asset_for_mix = os.path.join(temp_dir, 'asset_stretched.wav')
-            atempo_asset_str = get_atempo_filter(asset_rate)
-            if run_ffmpeg(
-                f'ffmpeg -y -i "{normalized_asset_path}" '
-                f'-filter:a "{atempo_asset_str}" "{stretched_asset_for_mix}"'
-            ):
-                logger.info(
-                    f"[mix] Asset tempo stretched: rate={asset_rate:.3f}, "
-                    f"raw_bpm={music_tempo:.1f}->{bpm_plan['adjusted_raw_music_tempo']:.1f}, "
-                    f"normalized_bpm={bpm_plan['music_tempo']:.1f}->{bpm_plan['adjusted_music_tempo']:.1f}"
-                )
-            else:
-                logger.warning("[mix] Asset atempo stretch failed, using original asset")
-                stretched_asset_for_mix = normalized_asset_path
+        # Load asset track
+        logger.info(f"[mix] Loading track: {asset_audio}")
+        track_raw, track_sr = librosa.load(asset_audio, sr=None, mono=False)
+        if track_raw.ndim == 1:
+            track_raw = np.vstack([track_raw, track_raw]) 
+        n_ch, track_samples = track_raw.shape
+        
+        track_mono = librosa.to_mono(track_raw)
+        track_rms = np.sqrt(np.mean(track_mono**2))
+        raw_rms_db = 20 * np.log10(track_rms) if track_rms > 0 else -100
+        
+        sample_len = min(len(track_mono), 30 * track_sr)
+        S, _ = librosa.magphase(librosa.stft(track_mono[:sample_len]))
+        centroid = np.mean(librosa.feature.spectral_centroid(S=S, sr=track_sr))
+        
+        logger.info(f"[mix] Original Track: RMS = {raw_rms_db:.2f} dBFS, Centroid = {centroid:.0f} Hz")
+        
+        # AI Logic: Leveling
+        if raw_rms_db > -14.0:
+            target_track_rms = -17.0
+            track_norm = normalize_rms(track_raw, target_track_rms)
+            logger.info(f"[mix] AI Action (Leveling): Track is LOUD. Reduced to {target_track_rms} dBFS.")
         else:
-            stretched_asset_for_mix = normalized_asset_path
- 
-        # ── 5. Normalize heartbeat ───────────────────────────────────────────
-        picked_seg = AudioSegment.from_file(stretched_path, format='wav').normalize()
-        # RMS boost nếu signal sparse (HPSS percussive)
-        target_rms_dbfs = -16.0 if bpm_mode == "ambient-texture" else -12.0
-        if picked_seg.dBFS < target_rms_dbfs:
-            boost_cap = 12.0 if bpm_mode == "ambient-texture" else 18.0
-            boost = min(target_rms_dbfs - picked_seg.dBFS, boost_cap)
-            picked_seg = picked_seg + boost
-            logger.info(f"[mix] RMS boost: +{boost:.1f}dB")
-        picked_seg.export(normalized_picked_path, format="wav")
-        heart_len_s = len(picked_seg) / 1000.0
-        logger.info(f"[mix] Normalized heartbeat: {heart_len_s:.1f}s, dBFS={picked_seg.dBFS:.1f}")
- 
-        # ── 6. Volume balance ─────────────────────────────────────────────────
-        vol_picked = fast_mean_volume(normalized_picked_path)
-        diff = vol_asset - vol_picked
-        logger.info(f"[mix] Volume: asset={vol_asset:.1f}dB, picked={vol_picked:.1f}dB, diff={diff:.1f}dB")
+            target_track_rms = raw_rms_db
+            track_norm = track_raw.copy()
+            logger.info(f"[mix] AI Action (Leveling): Track is QUIET/AMBIENT. Preserved volume at {target_track_rms:.2f} dBFS.")
 
-        # ── 7. Prepare a finite heartbeat bed + mix ─────────────────────────
-        # Heartbeat bed chỉ có intro silence/ramp ở lần đầu, các lần lặp dùng crossfade
-        # để loại bỏ khe nghỉ và tránh cảm giác loop bị khựng.
-        try:
-            asset_dur_s = float(sf.info(stretched_asset_for_mix).duration)
-            logger.info(f"[mix] Asset WAV duration: {asset_dur_s:.1f}s")
-        except Exception as e:
-            logger.warning(f"[mix] sf.info WAV failed ({e}), skip duration threshold check")
-            asset_dur_s = 0.0
-
-        heartbeat_bed_path = os.path.join(temp_dir, 'picked_loopbed.wav')
-        heartbeat_bed_target_s = max(
-            asset_dur_s + INTRO_SECONDS + FADE_OUT_SECONDS + 2.0,
-            heart_len_s * 4.0,
-            INTRO_SECONDS + 12.0,
-        )
-        loop_bed_ready = _build_looped_heartbeat_bed(
-            normalized_picked_path,
-            heartbeat_bed_path,
-            heartbeat_bed_target_s,
-        )
-        if loop_bed_ready:
-            picked_mix_input_path = heartbeat_bed_path
-            logger.info(
-                f"[mix] Loop bed ready: target={heartbeat_bed_target_s:.1f}s, "
-                f"crossfade={HEARTBEAT_LOOP_CROSSFADE_MS}ms"
-            )
+        # AI Logic: EQ
+        if centroid > 1200:
+            track_norm = low_pass_filter(track_norm, track_sr, 8000.0)
+            logger.info(f"[mix] AI Action (EQ): Track is BRIGHT. Applied Low-Pass Filter @ 8000Hz.")
+        elif centroid > 800:
+            track_norm = low_pass_filter(track_norm, track_sr, 6000.0)
+            logger.info(f"[mix] AI Action (EQ): Track is MEDIUM-BRIGHT. Applied Low-Pass Filter @ 6000Hz.")
         else:
-            picked_mix_input_path = normalized_picked_path
-            logger.warning("[mix] Loop bed build failed, falling back to legacy heartbeat input")
+            logger.info(f"[mix] AI Action (EQ): Track is DARK. NO Low-Pass Filter applied.")
 
-        # Build optimized mix filter chain
-        fade_in_s = FADE_IN_SECONDS
-        fade_out_s = FADE_OUT_SECONDS
-        fade_out_start = max(0.0, (asset_dur_s + INTRO_SECONDS) - fade_out_s) if asset_dur_s > 0 else (INTRO_SECONDS + 12.0)
+        # Pad track (15.0s fade_duration padded)
+        FADE_DURATION = 15.0
+        fade_n = int(FADE_DURATION * track_sr)
+        total_samples = fade_n + track_samples + fade_n
+        
+        track_padded = np.zeros((n_ch, total_samples), dtype=np.float32)
+        track_padded[:, fade_n : fade_n + track_samples] = track_norm
 
-        mix_params = {
-            'intro_delay_ms': INTRO_DELAY_MS,
-            'volume_asset': safe_db(max(0, -diff) - (2 if bpm_mode == 'ambient-texture' else 3)),
-            'volume_picked': safe_db(max(1, diff + 1) + (3 if bpm_mode == 'ambient-texture' else 6)),
-            'fade_in_s': fade_in_s,
-            'fade_out_s': fade_out_s,
-            'fade_out_start': fade_out_start,
-            'bpm_mode': bpm_mode,
-            'use_loop_bed': loop_bed_ready,
-            'asset_weight': bpm_plan.get('asset_weight', 1.0 - STANDARD_HEARTBEAT_WEIGHT),
-            'heart_weight': bpm_plan.get('heart_weight', STANDARD_HEARTBEAT_WEIGHT),
-            'heart_len_s': heart_len_s,
-            'sr': sr,
-            'lowpass_f': 420 if bpm_mode == "ambient-texture" else 350,
-        }
+        # Load heartbeat
+        logger.info(f"[mix] Loading heartbeat: {picked_audio}")
+        y_hb, hb_sr = librosa.load(picked_audio, sr=None, mono=True)
+        
+        logger.info(f"[mix] Extracting continuous stable 3s segment (Zero-Crossing + Boundary Check)...")
+        y_seg, s, e, orig_s, orig_e, stats = extract_continuous_stable_3s(y_hb, hb_sr)
+        
+        logger.info(f"[mix] Creating SEAMLESS LOOP (Autocorrelation Beat-Sync)...")
+        target_duration_sec = total_samples / track_sr
+        hb_loop_raw = create_seamless_loop(y_hb, hb_sr, s, e, target_duration=target_duration_sec, crossfade_ms=80.0)
+        
+        if hb_sr != track_sr:
+            hb_loop_raw = librosa.resample(hb_loop_raw, orig_sr=hb_sr, target_sr=track_sr)
+            
+        if len(hb_loop_raw) > total_samples:
+            hb_loop_raw = hb_loop_raw[:total_samples]
+        elif len(hb_loop_raw) < total_samples:
+            pad_len = total_samples - len(hb_loop_raw)
+            hb_loop_raw = np.pad(hb_loop_raw, (0, pad_len), mode='constant')
+            
+        # AI Logic: Heartbeat Volume = Track Volume - 10 dB
+        heartbeat_target_rms = target_track_rms - 10.0
+        seg_norm = normalize_rms(hb_loop_raw, heartbeat_target_rms)
+        logger.info(f"[mix] Heartbeat synced at {heartbeat_target_rms:.2f} dBFS (-10dB below track).")
+        
+        seg_stereo = np.stack([seg_norm] * n_ch, axis=0).astype(np.float32)
+        
+        # Envelope fade (3s env_fade_duration)
+        ENV_FADE_DURATION = 3.0
+        env_fade_n = int(ENV_FADE_DURATION * track_sr)
+        stable_env = np.ones(total_samples, dtype=np.float32)
+        stable_env[:env_fade_n]  = np.linspace(0.0, 1.0, env_fade_n)
+        stable_env[-env_fade_n:] = np.linspace(1.0, 0.0, env_fade_n)
+        
+        seg_mix = seg_stereo * stable_env[np.newaxis, :]
 
-        if not loop_bed_ready:
-            heartbeat_ramp_end_s = HEARTBEAT_SILENT_LEAD_SECONDS + HEARTBEAT_VOLUME_RAMP_SECONDS
-            heartbeat_intro_envelope = (
-                f"if(lt(t,{HEARTBEAT_SILENT_LEAD_SECONDS:.2f}),0,"
-                f"if(lt(t,{heartbeat_ramp_end_s:.2f}),"
-                f"(t-{HEARTBEAT_SILENT_LEAD_SECONDS:.2f})/{HEARTBEAT_VOLUME_RAMP_SECONDS:.2f},1))"
-            )
-            mix_params['heart_ramp_end_s'] = heartbeat_ramp_end_s
-            mix_params['heartbeat_intro_envelope'] = heartbeat_intro_envelope
+        logger.info(f"[mix] FINAL MIXING & PEAK PROTECTION...")
+        mix_out = seg_mix + track_padded
+        
+        # Master Peak Limiter
+        final_out = smart_peak_limiter(mix_out, ceiling_db=-0.1)
 
-        mix_filter = _build_optimized_mix_filter(mix_params, quality_info)
-
-        enc = codec_args(mixed_temp_path)
-        picked_mix_input_flag = f'"{picked_mix_input_path}"'
-        primary_mix_ok = run_ffmpeg(
-            f'ffmpeg -y -i "{stretched_asset_for_mix}" -i {picked_mix_input_flag} '
-            f'-filter_complex "{mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
-        )
-        if primary_mix_ok:
-            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
-                logger.info(f"[mix] ✅ mixed_temp_path created: {mixed_temp_path} (size={os.path.getsize(mixed_temp_path)})")
-            else:
-                logger.error(f"[mix] ❌ mixed_temp_path MISSING/EMPTY after successful ffmpeg: {mixed_temp_path}")
-                primary_mix_ok = False
+        temp_wav_out = os.path.join(temp_dir, 'final_mix.wav')
+        sf.write(temp_wav_out, final_out.T, track_sr, subtype='PCM_16')
+        
+        logger.info(f"[mix] Saved temporary WAV. Converting to target format: {output_path}")
+        
+        # Convert qua output_path (FLAC/MP3) bằng ffmpeg
+        import subprocess, shlex
+        ext = os.path.splitext(output_path)[1].lower()
+        if ext == '.flac':
+            cmd = f'ffmpeg -y -i "{temp_wav_out}" -c:a flac -compression_level 5 "{output_path}"'
+        elif ext == '.mp3':
+            cmd = f'ffmpeg -y -i "{temp_wav_out}" -c:a libmp3lame -b:a 192k "{output_path}"'
         else:
-            logger.error(f"[mix] ❌ primary mix filter chain failed")
+            cmd = f'ffmpeg -y -i "{temp_wav_out}" "{output_path}"'
 
-        # With loop_bed_ready: fade + 432Hz are already in the optimized filter chain
-        if loop_bed_ready:
-            logger.info("[mix] ✅ Fade + 432Hz included in optimized filter chain")
-
-        # Nếu loop_bed_ready=True VÀ primary_mix_ok: fade + 432Hz đã nằm trong filter chain
-        if loop_bed_ready and primary_mix_ok:
-            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
-                is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
-                    mixed_temp_path,
-                    expected_asset_duration=asset_dur_s,
-                )
-                logger.info(
-                    f"[mix] Loop bed health check: ok={is_healthy}, reason={health_reason}, "
-                    f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
-                )
-                if is_healthy:
-                    import shutil
-                    shutil.copy2(mixed_temp_path, output_path)
-                    logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
-                    return
-                logger.warning(f"[mix] Loop bed primary output unhealthy ({health_reason}), retrying fallback")
-                primary_mix_ok = False
-            else:
-                raise RuntimeError("[mix] loop_bed_ready but mixed_temp_path missing/empty, cannot create output")
-
-        if not primary_mix_ok:
-            logger.warning("[mix] Primary filter chain failed, retrying with safe fallback mix chain")
-            asset_filter = (
-                f"[0:a]"
-                f"adelay={mix_params['intro_delay_ms']}|{mix_params['intro_delay_ms']},"
-                f"equalizer=f=100:width_type=o:width=2:g=-5,"
-                f"volume={safe_db(mix_params['volume_asset'])}dB"
-                f"[a0];"
-            )
-            if loop_bed_ready:
-                fallback_picked_filter = (
-                    f"[1:a]"
-                    f"highpass=f=55,lowpass=f=380,"
-                    f"volume={safe_db(max(0, diff) + (1 if bpm_mode == 'ambient-texture' else 3))}dB,"
-                    f"acompressor=threshold=-20dB:ratio=1.4:attack=10:release=120,"
-                    f"afftdn=nf={safe_afftdn_nf(-24.0):.1f}"
-                    f"[a1];"
-                )
-            else:
-                fallback_picked_filter = (
-                    f"[1:a]"
-                    f"highpass=f=55,lowpass=f=380,"
-                    f"volume='{heartbeat_intro_envelope}':eval=frame,"
-                    f"volume={safe_db(max(0, diff) + (1 if bpm_mode == 'ambient-texture' else 3))}dB,"
-                    f"acompressor=threshold=-20dB:ratio=1.4:attack=10:release=120,"
-                    f"afftdn=nf={safe_afftdn_nf(-24.0):.1f},"
-                    f"aloop=loop=-1:size={int(heart_len_s * sr)}"
-                    f"[a1];"
-                )
-            fallback_mix_filter = (
-                f"{asset_filter}{fallback_picked_filter}"
-                f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
-                f":weights={mix_params['asset_weight']:.3f} {mix_params['heart_weight']:.3f},"
-                f"alimiter=limit=0.9"
-                f"[a]"
-            )
-            fallback_input_flag = picked_mix_input_flag if loop_bed_ready else f'-i "{normalized_picked_path}"'
-            primary_mix_ok = run_ffmpeg(
-                f'ffmpeg -y -i "{stretched_asset_for_mix}" {fallback_input_flag} '
-                f'-filter_complex "{fallback_mix_filter}" -map "[a]" {enc} "{mixed_temp_path}"'
-            )
-
-        if not primary_mix_ok:
-            logger.error("[mix] Final mix FFmpeg call failed after safe fallback")
-            raise RuntimeError("[mix] Primary mix and all fallbacks failed, cannot create output")
-
-
-        # For loop_bed_ready=True: fade+432Hz already in filter chain
-        # Skip health check and fade+432Hz section
-        if loop_bed_ready:
-            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
-                is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
-                    mixed_temp_path,
-                    expected_asset_duration=asset_dur_s,
-                )
-                logger.info(
-                    f"[mix] Loop bed fallback health check: ok={is_healthy}, reason={health_reason}, "
-                    f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
-                )
-                if not is_healthy:
-                    raise RuntimeError(f"[mix] Loop bed output unhealthy: {health_reason}")
-                import shutil
-                shutil.copy2(mixed_temp_path, output_path)
-                logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
-                return
-            else:
-                raise RuntimeError("[mix] loop_bed_ready but mixed_temp_path missing/empty")
-
-        is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
-            mixed_temp_path,
-            expected_asset_duration=asset_dur_s,
-        )
-        logger.info(
-            f"[mix] Mixed health check: ok={is_healthy}, reason={health_reason}, "
-            f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
-        )
-
-        if not is_healthy:
-            fallback_mixed_path = os.path.join(temp_dir, 'mixed_temp_fallback.flac')
-            logger.warning(f"[mix] Primary mix unhealthy ({health_reason}), running safe fallback chain")
-            if loop_bed_ready:
-                fallback_filter = (
-                    f"[0:a]"
-                    f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
-                    f"equalizer=f=100:width_type=o:width=2:g=-3,"
-                    f"volume={safe_db(max(0, -diff) - 2)}dB"
-                    f"[a0];"
-                    f"[1:a]"
-                    f"highpass=f=55,lowpass=f=360,"
-                    f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
-                    f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
-                    f"[a1];"
-                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights={mix_params['asset_weight']:.3f} {mix_params['heart_weight']:.3f},"
-                    f"alimiter=limit=0.92"
-                    f"[a]"
-                )
-            else:
-                fallback_filter = (
-                    f"[0:a]"
-                    f"adelay={INTRO_DELAY_MS}|{INTRO_DELAY_MS},"
-                    f"equalizer=f=100:width_type=o:width=2:g=-3,"
-                    f"volume={safe_db(max(0, -diff) - 2)}dB"
-                    f"[a0];"
-                    f"[1:a]"
-                    f"highpass=f=55,lowpass=f=360,"
-                    f"volume='{heartbeat_intro_envelope}':eval=frame,"
-                    f"volume={safe_db(max(1, diff + 1) + 4)}dB,"
-                    f"acompressor=threshold=-20dB:ratio=2:attack=6:release=120"
-                    f"[a1];"
-                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=1:weights={mix_params['asset_weight']:.3f} {mix_params['heart_weight']:.3f},"
-                    f"alimiter=limit=0.92"
-                    f"[a]"
-                )
-            fallback_input_flag = picked_mix_input_flag if loop_bed_ready else f'-stream_loop -1 -i "{normalized_picked_path}"'
-            fallback_ok = run_ffmpeg(
-                f'ffmpeg -y -i "{stretched_asset_for_mix}" {fallback_input_flag} '
-                f'-filter_complex "{fallback_filter}" -map "[a]" '
-                f'-c:a flac -compression_level 5 "{fallback_mixed_path}"'
-            )
-            if not fallback_ok:
-                logger.error("[mix] Safe fallback chain failed")
-                raise RuntimeError("[mix] Safe fallback chain failed, cannot create output")
-
-            fb_ok, fb_reason, fb_dur, fb_db = evaluate_mixed_output(
-                fallback_mixed_path,
-                expected_asset_duration=asset_dur_s,
-            )
-            logger.info(
-                f"[mix] Fallback health check: ok={fb_ok}, reason={fb_reason}, "
-                f"duration={fb_dur:.1f}s, dbfs={fb_db:.1f}"
-            )
-            if not fb_ok:
-                logger.error(f"[mix] Fallback output still unhealthy: {fb_reason}")
-                raise RuntimeError(f"[mix] Fallback output still unhealthy: {fb_reason}")
-            mixed_temp_path = fallback_mixed_path
-
-        # After all mix attempts: if loop_bed_ready, fade+432Hz are already applied
-        # → copy mixed_temp_path to output_path and return
-        if loop_bed_ready:
-            if os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0:
-                is_healthy, health_reason, measured_mix_dur, measured_mix_db = evaluate_mixed_output(
-                    mixed_temp_path,
-                    expected_asset_duration=asset_dur_s,
-                )
-                logger.info(
-                    f"[mix] Loop bed final health check: ok={is_healthy}, reason={health_reason}, "
-                    f"duration={measured_mix_dur:.1f}s, dbfs={measured_mix_db:.1f}"
-                )
-                if not is_healthy:
-                    raise RuntimeError(f"[mix] Loop bed output unhealthy after all attempts: {health_reason}")
-                import shutil
-                shutil.copy2(mixed_temp_path, output_path)
-                logger.info(f"[mix] ✅ Mix completed (loop bed mode) → {output_path}")
-                return
-            else:
-                raise RuntimeError("[mix] loop_bed_ready but mixed_temp_path missing/empty after all attempts")
-
-        # ── 8. Fade-in / Fade-out → sau đó 432Hz (2 bước riêng) ───────────────
-        # Only runs when loop_bed_ready=False
-        # When loop_bed_ready=True, the code returns above.
-        # Dùng sf.info(stretched_asset_for_mix) — ĐÂY LÀ WAV → luôn đọc được.
-        # KHÔNG dùng ffprobe hay sf.info(FLAC) vì cả hai đều fail trên Docker.
-        #
-        # Timing: mixed file duration ≈ asset_dur + 4s (do adelay=4000ms)
-        # → fade_out_start = mixed_dur - fade_out_duration
-        if not (os.path.exists(mixed_temp_path) and os.path.getsize(mixed_temp_path) > 0):
-            logger.error("[mix] mixed_temp is empty/missing, cannot process")
-            raise RuntimeError("[mix] mixed_temp is empty/missing, cannot create output")
-
-        try:
-            mixed_dur_s = float(sf.info(mixed_temp_path).duration)
-        except Exception as mixed_info_err:
-            logger.warning(f"[mix] Cannot read mixed duration via soundfile: {mixed_info_err}")
-            mixed_dur_s = 0.0
-
-        if mixed_dur_s <= 0:
-            mixed_dur_s = (asset_dur_s + INTRO_SECONDS) if asset_dur_s > 0 else (INTRO_SECONDS + 12.0)
-
-        fade_in_s      = FADE_IN_SECONDS
-        fade_out_s     = FADE_OUT_SECONDS
-        fade_out_start = max(0.0, mixed_dur_s - fade_out_s)
-        logger.info(
-            f"[mix] Fade: in 0→{fade_in_s}s | "
-            f"out {fade_out_start:.1f}→{fade_out_start + fade_out_s:.1f}s"
-        )
-
-        # ── 8a. Apply afade trên finite FLAC mixed file ───────────────────────
-        faded_mixed_path = os.path.join(temp_dir, 'mixed_faded.flac')
-        fade_parts = []
-        if fade_in_s > 0.01:
-            fade_parts.append(f"afade=t=in:st=0:d={fade_in_s:.2f}")
-        if fade_out_s > 0.01:
-            fade_parts.append(f"afade=t=out:st={fade_out_start:.2f}:d={fade_out_s:.2f}")
-
-        fade_ok = True
-        if fade_parts:
-            fade_filter = ",".join(fade_parts)
-            fade_ok = run_ffmpeg(
-                f'ffmpeg -y -i "{mixed_temp_path}" '
-                f'-af "{fade_filter}" '
-                f'-c:a flac -compression_level 5 "{faded_mixed_path}"'
-            )
-        else:
-            fade_ok = run_ffmpeg(
-                f'ffmpeg -y -i "{mixed_temp_path}" -c:a flac -compression_level 5 "{faded_mixed_path}"'
-            )
-        if fade_ok and os.path.exists(faded_mixed_path) and os.path.getsize(faded_mixed_path) > 0:
-            logger.info("[mix] ✅ Fade-in/out applied successfully")
-            src_for_432 = faded_mixed_path
-        else:
-            logger.warning("[mix] ⚠️ Fade step failed — applying 432Hz without fade")
-            src_for_432 = mixed_temp_path
-
-        # ── 8b. 432Hz tuning ──────────────────────────────────────────────────
-        if not tune_to_432hz(src_for_432, output_path):
-            logger.warning("[mix] 432Hz tuning failed, exporting original mixed source")
-            if not run_ffmpeg(
-                f'ffmpeg -y -i "{src_for_432}" {codec_args(output_path)} "{output_path}"'
-            ):
-                logger.error("[mix] Final export failed after 432Hz fallback")
-                raise RuntimeError("[mix] Cannot create output: both 432Hz and fallback failed")
-        logger.info(f"[mix] ✅ 432Hz tuning done → {output_path}")
-
- 
-
-        # ── 9. Final validation ───────────────────────────────
-        if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
-            logger.error(f"[mix] CRITICAL: output_path not created at end of function: {output_path}")
-            raise RuntimeError(f"[mix] Output file not created: {output_path}")
-        logger.info(f"[mix] Final output validated: {output_path} (size={os.path.getsize(output_path)})")
+        res = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0:
+            logger.error(f"[mix] FFmpeg conversion failed: {res.stderr.decode()}")
+            raise RuntimeError("FFmpeg conversion failed.")
+        
+        logger.info(f"[mix] ✅ Mix completed (Smart AI DSP) → {output_path}")
 
     except Exception as e:
-        logger.error(f"[mix] Error: {e}\n{traceback.format_exc()}")
-        logger.error(f"[mix] output_path exists at exception time: {os.path.exists(output_path)}")
+        logger.error(f"[mix] Error in Smart AI Mastering DSP: {e}\n{traceback.format_exc()}")
         raise
     finally:
         logger.info(f"[mix] === END mix_audio_v1 ===")
+        # keep the temp_dir cleaning by TemporaryDirectory auto cleanup
         logger.info(f"[mix] output_path (absolute) at finally: {output_path}")
         logger.info(f"[mix] output_path exists at finally: {os.path.exists(output_path)}")
         if os.path.exists(output_path):
