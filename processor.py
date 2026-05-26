@@ -8,6 +8,7 @@ import librosa
 from pydub import AudioSegment
 import numpy as np
 from scipy import signal
+import scipy.signal
 import soundfile as sf
 import logging
 import traceback
@@ -116,39 +117,52 @@ def snap_to_zero_crossing(y: np.ndarray, sr: int, target: int, search_ms: int = 
     return target
 
 def extract_continuous_stable_3s(y: np.ndarray, sr: int):
-    orig_start, orig_end, stats = find_best_window(y, sr)
-    smooth_win = max(1, int(0.04 * sr))
-    envelope   = np.sqrt(np.convolve(y**2, np.ones(smooth_win) / smooth_win, mode='same'))
+    orig_start, orig_end, _ = find_best_window(y, sr)
+    # === FIND ALL VALLEYS + COST MINIMIZATION CHO S VA E ===
+    env_smooth = int(0.05 * sr)
+    full_env = np.sqrt(np.convolve(y**2, np.ones(env_smooth)/env_smooth, mode='same'))
+    med_rms = np.median(full_env)
+    
+    # Bo distance de khong bo sot cac valley cuc bo
+    valleys, _ = scipy.signal.find_peaks(-full_env)
 
-    def find_snap_point(target, radius_ms=500):
-        radius = int((radius_ms / 1000.0) * sr)
-        lo = max(0, target - radius)
-        hi = min(len(envelope) - 1, target + radius)
-        if lo >= hi: return target
-        local_env = envelope[lo:hi]
-        max_rms = np.max(envelope)
-        if max_rms == 0: max_rms = 1.0
-        local_env_norm = local_env / max_rms
-        distances_sec = np.abs(np.arange(lo, hi) - target) / sr
-        penalty_per_sec = 0.3
-        cost = local_env_norm + (distances_sec * penalty_per_sec)
-        best_idx = int(np.argmin(cost)) + lo
-        rms_at_best   = envelope[best_idx]
-        rms_at_target = envelope[min(target, len(envelope) - 1)]
+    def find_best_valley(target_idx, search_lo, search_hi, alpha=5.0):
+        best_cost = float('inf')
+        best_v = target_idx
+        for v in valleys:
+            if search_lo <= v <= search_hi:
+                rms = full_env[v]
+                rms_norm = rms / (med_rms + 1e-6)
+                dist_sec = abs(v - target_idx) / sr
+                cost = rms_norm + alpha * dist_sec
+                if cost < best_cost:
+                    best_cost = cost
+                    best_v = v
+        
+        # Guard: Neu diem valley tim duoc khong cai thien qua 15% so voi diem target hien tai thi giu nguyen target
+        rms_at_best = full_env[best_v]
+        rms_at_target = full_env[min(target_idx, len(full_env) - 1)]
         if rms_at_target > 0 and rms_at_best >= 0.85 * rms_at_target:
-            return target 
-        return best_idx
+            return target_idx
+            
+        return best_v
 
-    s = find_snap_point(orig_start, radius_ms=500)
-    e = find_snap_point(orig_end,   radius_ms=500)
+    # Tim s (ban kinh +- 1.5s quanh orig_start de quet rong hon)
+    s = find_best_valley(orig_start, max(0, orig_start - int(1.5 * sr)), min(len(y) - 1, orig_start + int(1.5 * sr)))
+    
+    # Tim e (quet tu s + 1.5s den s + 4.5s de nam trong khoang 3s, uu tien vung gan orig_end)
+    e = find_best_valley(orig_end, s + int(1.5 * sr), min(len(y) - 1, s + int(4.5 * sr)))
 
+    # Gioi han min_duration neu file qua ngan
     min_duration = int(1.9 * sr)
     min_duration = min(min_duration, len(y) - s - int(0.1*sr))
     min_duration = max(min_duration, int(1.0 * sr)) 
 
+    # Neu e bi chong cheo hoac ngan hon min_duration thi ep e dich ra xa
     if e < s + min_duration:
         e = min(s + min_duration, len(y) - 1)
 
+    # Fine-snap +-5ms quanh diem ria de chot zero-crossing
     s = snap_to_zero_crossing(y, sr, s, search_ms=5)
     e = snap_to_zero_crossing(y, sr, e, search_ms=5, min_idx=s + min_duration)
 
@@ -157,98 +171,85 @@ def extract_continuous_stable_3s(y: np.ndarray, sr: int):
         if s >= e or e > len(y):
             s, e = orig_start, orig_end
 
-    segment = y[s:e].copy()
-    return segment, s, e, orig_start, orig_end, stats
+    return s, e
 
 def create_seamless_loop(y: np.ndarray, sr: int, s: int, e: int, target_duration: float = 30.0, crossfade_ms: float = 80.0) -> np.ndarray:
-    y_cut = y[s:e]
-    seg_len_exact = e - s
+    """
+    Tao file loop 30s.
+    Phuong phap:
+    1. Dung Cross-Correlation de tim chu ky (cycle length L) tron xoe nhat (tranh vấp nhip).
+    2. Chi ap dung crossfade rat ngan (80ms) o diem cat L de khong bi chong cheo dai gay giam am luong (phasing/volume dip).
+    """
+    y_cut = y[s:e].copy()
     
+    # 1. Tinh Envelope de so khop nhip
     smooth_win = int(0.04 * sr)
-    rms = np.sqrt(np.convolve(y_cut**2, np.ones(smooth_win) / smooth_win, mode='same'))
-    ac = librosa.autocorrelate(rms)
-    min_lag = int(0.35 * sr) 
-    max_lag = int(2.0 * sr)
+    env = np.sqrt(np.convolve(y_cut**2, np.ones(smooth_win) / smooth_win, mode='same'))
     
-    if len(ac) > max_lag:
-        best_lag = min_lag + np.argmax(ac[min_lag:max_lag])
-        true_beat = best_lag / sr
-        target_len_sec = np.floor((len(y_cut)/sr) / true_beat) * true_beat
-        if target_len_sec >= len(y_cut)/sr:
-            target_len_sec -= true_beat
-        target_samples = int(target_len_sec * sr)
-        zc = np.where((y_cut[:-1] < 0) & (y_cut[1:] >= 0))[0]
-        
-        best_pair = None
-        min_error = float('inf')
-        for z1 in zc:
-            if z1 > 0.5 * sr: continue 
-            expected_z2 = z1 + target_samples
-            if expected_z2 >= len(y_cut): continue
-            idx = np.argmin(np.abs(zc - expected_z2))
-            closest_z2 = zc[idx]
-            error = abs(closest_z2 - expected_z2)
-            if error < min_error:
-                min_error = error
-                best_pair = (z1, closest_z2)
-                
-        if best_pair is not None and min_error < 0.01 * sr:
-            z1, z2 = best_pair
-            segment = y_cut[z1:z2].astype(np.float64).copy()
-            seg_len = len(segment)
-            loop_times = int(round(target_duration * sr / seg_len))
-            if loop_times < 1: loop_times = 1
-            out_len = loop_times * seg_len
-            output = np.zeros(out_len, dtype=np.float64)
-            for i in range(loop_times):
-                pos = i * seg_len
-                output[pos : pos + seg_len] = segment
-            target_samples_out = int(target_duration * sr)
-            if len(output) > target_samples_out:
-                output = output[:target_samples_out]
-            return output.astype(y.dtype)
-
-    fade_len = int((crossfade_ms / 1000.0) * sr)
-    can_borrow = (s >= fade_len)
-    if can_borrow:
-        loop_times = int(round(target_duration * sr / seg_len_exact))
-        if loop_times < 1: loop_times = 1
-        total_samples = loop_times * seg_len_exact
-        output = np.zeros(total_samples, dtype=np.float64)
-        s_expanded = s - fade_len
-        segment = y[s_expanded : e].astype(np.float64).copy()
-        t = np.linspace(0, 1, fade_len, dtype=np.float64)
-        fade_in_env  = t
-        fade_out_env = 1.0 - t
-        pos = 0
-        for i in range(loop_times):
-            seg_win = segment.copy()
-            seg_win[-fade_len:] *= fade_out_env
-            seg_win[:fade_len] *= fade_in_env
-            write_len = len(seg_win)
-            if pos + write_len > total_samples:
-                in_bound = total_samples - pos
-                output[pos:pos+in_bound] += seg_win[:in_bound]
-                overflow = write_len - in_bound
-                output[0:overflow] += seg_win[in_bound:]
+    # 2. Tim chu ky hoan hao bang Cross-Correlation
+    min_overlap = int(0.1 * sr)
+    max_overlap = int(1.2 * sr)
+    max_overlap = min(max_overlap, len(y_cut) // 2)
+    
+    best_O = min_overlap
+    best_score = -float('inf')
+    
+    if max_overlap > min_overlap:
+        for O in range(min_overlap, max_overlap, int(0.01 * sr)): # Buoc nhay 10ms
+            head = env[:O]
+            tail = env[-O:]
+            if np.std(head) > 0 and np.std(tail) > 0:
+                score = np.corrcoef(head, tail)[0, 1]
             else:
-                output[pos:pos+write_len] += seg_win
-            pos += seg_len_exact
-        return output.astype(y.dtype)
+                score = -1
+                
+            if score > best_score:
+                best_score = score
+                best_O = O
+                
+    # Fallback neu khong tim thay su tuong quan tot (< 0.4)
+    if best_score > 0.4:
+        L_samples = len(y_cut) - best_O
     else:
-        segment = y[s:e].astype(np.float64).copy()
-        seg_len = len(segment)
-        loop_times = int(round(target_duration * sr / seg_len))
-        if loop_times < 1: loop_times = 1
-        out_len = loop_times * seg_len
-        output = np.zeros(out_len, dtype=np.float64)
-        for i in range(loop_times):
-            pos = i * seg_len
-            output[pos : pos + seg_len] = segment
-        target_samples_out = int(target_duration * sr)
-        if len(output) > target_samples_out:
-            output = output[:target_samples_out]
-        return output.astype(y.dtype)
+        # File khong co tinh chu ky ro rang, L_samples gan het file, de lai mot doan crossfade
+        fade_len_default = int((crossfade_ms / 1000.0) * sr)
+        L_samples = max(1, len(y_cut) - fade_len_default)
+        
+    # 3. Tao Loop chi voi 80ms crossfade
+    fade_len = int((crossfade_ms / 1000.0) * sr)
+    # Dam bao fade_len khong vuot qua phan am thanh con du
+    fade_len = min(fade_len, len(y_cut) - L_samples)
+    if fade_len <= 0: fade_len = 1
+    
+    loop_times = int(np.ceil((target_duration * sr) / L_samples))
+    if loop_times < 1: loop_times = 1
+    
+    out_len = L_samples * loop_times + fade_len
+    output = np.zeros(out_len, dtype=np.float64)
+    
+    # Dung Equal Power crossfade vi doan noi chi co 80ms
+    t = np.linspace(0, 1, fade_len, dtype=np.float64)
+    fade_in = np.sqrt(t)
+    fade_out = np.sqrt(1.0 - t)
+    
+    for i in range(loop_times):
+        pos = i * L_samples
+        # Chi lay 1 chu ky (L_samples) cong them phan duoi (fade_len) de crossfade
+        seg_win = y_cut[:L_samples + fade_len].astype(np.float64).copy()
+        
+        if i > 0:
+            seg_win[:fade_len] *= fade_in
+        if i < loop_times - 1:
+            seg_win[-fade_len:] *= fade_out
+            
+        output[pos : pos + len(seg_win)] += seg_win
+        
+    # Cat dung do dai target
+    target_samples_out = int(target_duration * sr)
+    if len(output) > target_samples_out:
+        output = output[:target_samples_out]
+        
+    return output.astype(y.dtype)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_lfs_pointer(path: str) -> bool:
@@ -1813,12 +1814,15 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         track_mono = librosa.to_mono(track_raw)
         track_rms = np.sqrt(np.mean(track_mono**2))
         raw_rms_db = 20 * np.log10(track_rms) if track_rms > 0 else -100
+        track_peak = np.max(np.abs(track_mono))
+        raw_peak_db = 20 * np.log10(track_peak) if track_peak > 0 else -100
+        crest_factor = raw_peak_db - raw_rms_db
         
         sample_len = min(len(track_mono), 30 * track_sr)
         S, _ = librosa.magphase(librosa.stft(track_mono[:sample_len]))
         centroid = np.mean(librosa.feature.spectral_centroid(S=S, sr=track_sr))
         
-        logger.info(f"[mix] Original Track: RMS = {raw_rms_db:.2f} dBFS, Centroid = {centroid:.0f} Hz")
+        logger.info(f"[mix] Original Track: RMS = {raw_rms_db:.2f} dBFS, Peak = {raw_peak_db:.2f} dBFS, Crest = {crest_factor:.1f} dB, Centroid = {centroid:.0f} Hz")
         
         # AI Logic: Leveling
         if raw_rms_db > -14.0:
@@ -1853,7 +1857,7 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         y_hb, hb_sr = librosa.load(picked_audio, sr=None, mono=True)
         
         logger.info(f"[mix] Extracting continuous stable 3s segment (Zero-Crossing + Boundary Check)...")
-        y_seg, s, e, orig_s, orig_e, stats = extract_continuous_stable_3s(y_hb, hb_sr)
+        s, e = extract_continuous_stable_3s(y_hb, hb_sr)
         
         logger.info(f"[mix] Creating SEAMLESS LOOP (Autocorrelation Beat-Sync)...")
         target_duration_sec = total_samples / track_sr
@@ -1868,10 +1872,13 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             pad_len = total_samples - len(hb_loop_raw)
             hb_loop_raw = np.pad(hb_loop_raw, (0, pad_len), mode='constant')
             
-        # AI Logic: Heartbeat Volume = Track Volume - 10 dB
-        heartbeat_target_rms = target_track_rms - 10.0
+        # AI Logic: Auto-Adaptive Heartbeat Volume based on Crest Factor
+        # Dense track (Crest=11) -> -6dB. Sparse track (Crest=17) -> -12dB
+        dynamic_hb_offset = -6.0 - (crest_factor - 11.0)
+        dynamic_hb_offset = np.clip(dynamic_hb_offset, -14.0, -5.0)
+        heartbeat_target_rms = target_track_rms + dynamic_hb_offset
         seg_norm = normalize_rms(hb_loop_raw, heartbeat_target_rms)
-        logger.info(f"[mix] Heartbeat synced at {heartbeat_target_rms:.2f} dBFS (-10dB below track).")
+        logger.info(f"[mix] Heartbeat synced at {heartbeat_target_rms:.2f} dBFS (Offset: {dynamic_hb_offset:.1f}dB, Crest: {crest_factor:.1f}dB).")
         
         seg_stereo = np.stack([seg_norm] * n_ch, axis=0).astype(np.float32)
         
@@ -1884,8 +1891,42 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         
         seg_mix = seg_stereo * stable_env[np.newaxis, :]
 
-        logger.info(f"[mix] FINAL MIXING & PEAK PROTECTION...")
-        mix_out = seg_mix + track_padded
+        logger.info(f"[mix] FINAL MIXING & PEAK PROTECTION (WITH SIDECHAIN DUCKING)...")
+        
+        # 1. Extract Heartbeat Envelope
+        smooth_win = int(0.05 * track_sr)
+        hb_power = scipy.signal.fftconvolve(seg_norm**2, np.ones(smooth_win)/smooth_win, mode='same')
+        hb_power = np.maximum(hb_power, 0)
+        hb_env = np.sqrt(hb_power)
+        
+        env_max = np.max(hb_env)
+        if env_max > 1e-6:
+            hb_env = hb_env / env_max
+        else:
+            hb_env = np.zeros_like(hb_env)
+            
+        # 2. Create Ducking Curve (Dynamic based on Crest Factor)
+        dynamic_duck_db = 4.0 - (crest_factor - 11.0) * 0.5
+        dynamic_duck_db = np.clip(dynamic_duck_db, 0.0, 5.0)
+        logger.info(f"[mix] Sidechain Ducking applied: {dynamic_duck_db:.1f} dB reduction.")
+        
+        if dynamic_duck_db > 0.1:
+            duck_amount = 1.0 - (10 ** (-dynamic_duck_db / 20.0))
+            duck_curve = 1.0 - (hb_env * duck_amount)
+            
+            # 3. Smooth Release for natural sound
+            release_win = int(0.15 * track_sr)
+            duck_curve_release = scipy.signal.fftconvolve(duck_curve - 1.0, np.ones(release_win)/release_win, mode='same') + 1.0
+            duck_curve = np.clip(duck_curve_release, 0.1, 1.0)
+            
+            # Apply ducking to the track
+            track_ducked = track_padded * duck_curve[np.newaxis, :]
+        else:
+            # No ducking for very sparse tracks
+            track_ducked = track_padded
+        
+        # Mix
+        mix_out = seg_mix + track_ducked
         
         # Master Peak Limiter
         final_out = smart_peak_limiter(mix_out, ceiling_db=-0.1)
