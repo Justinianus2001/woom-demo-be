@@ -16,6 +16,7 @@ import math
 import hashlib
 import functools
 from pathlib import Path
+import concurrent.futures
 
 
 # ─── DSP HELPERS (Smart AI Mastering) ───────────────────────────────────────────
@@ -1844,6 +1845,53 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         else:
             logger.info(f"[mix] AI Action (EQ): Track is DARK. NO Low-Pass Filter applied.")
 
+        # Load heartbeat for BPM Sync & Mix
+        logger.info(f"[mix] Loading heartbeat: {picked_audio}")
+        y_hb, hb_sr = librosa.load(picked_audio, sr=None, mono=True)
+
+        # --- AI Logic: BPM Sync (New Forced Sync) ---
+        try:
+            if music_tempo and float(music_tempo) > 0:
+                track_tempo_val = float(music_tempo)
+                logger.info("[mix] Using provided music_tempo to skip analysis.")
+            else:
+                sample_len_beat = min(len(track_mono), 30 * track_sr)
+                track_tempo_arr, _ = librosa.beat.beat_track(y=track_mono[:sample_len_beat], sr=track_sr)
+                track_tempo_val = track_tempo_arr[0] if isinstance(track_tempo_arr, np.ndarray) else track_tempo_arr
+            
+            # Chuẩn hóa BPM nhạc nền (50 - 150)
+            if track_tempo_val > 0:
+                while track_tempo_val < 50:
+                    track_tempo_val *= 2.0
+                while track_tempo_val > 150:
+                    track_tempo_val /= 2.0
+                    
+            if heart_tempo and float(heart_tempo) > 0:
+                hb_tempo_val = float(heart_tempo)
+                logger.info("[mix] Using provided heart_tempo to skip analysis.")
+            else:
+                hb_tempo_arr, _ = librosa.beat.beat_track(y=y_hb, sr=hb_sr)
+                hb_tempo_val = hb_tempo_arr[0] if isinstance(hb_tempo_arr, np.ndarray) else hb_tempo_arr
+            
+            logger.info(f'[mix] Track BPM (Normalized): {track_tempo_val:.1f}, Heartbeat BPM: {hb_tempo_val:.1f}')
+            
+            if track_tempo_val > 0 and hb_tempo_val > 0:
+                # Ép đồng bộ hoàn toàn
+                rate = hb_tempo_val / track_tempo_val
+                # Cơ chế an toàn (Safety Mechanism) - Tránh OOM & biến dạng quá mức
+                clamped_rate = np.clip(rate, 0.5, 2.0)
+                
+                if abs(clamped_rate - 1.0) > 0.01:
+                    logger.info(f'[mix] AI Action (BPM Sync): Forced sync without octave limits. Time-stretching track by {clamped_rate:.3f}.')
+                    # Chạy tuần tự để tiết kiệm RAM, tránh OOM/Crash trên production server (đánh đổi chút CPU time)
+                    stretched_channels = [librosa.effects.time_stretch(track_norm[i], rate=clamped_rate) for i in range(n_ch)]
+                    track_norm = np.stack(stretched_channels, axis=0)
+                    track_samples = track_norm.shape[1]
+                else:
+                    logger.info(f'[mix] AI Action (BPM Sync): Rate is ~1.0, no stretch applied.')
+        except Exception as e:
+            logger.error(f"[mix] Safety Fallback: BPM Sync time_stretch failed, using original track. Error: {e}")
+
         # Pad track (15.0s fade_duration padded)
         FADE_DURATION = 15.0
         fade_n = int(FADE_DURATION * track_sr)
@@ -1851,10 +1899,6 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         
         track_padded = np.zeros((n_ch, total_samples), dtype=np.float32)
         track_padded[:, fade_n : fade_n + track_samples] = track_norm
-
-        # Load heartbeat
-        logger.info(f"[mix] Loading heartbeat: {picked_audio}")
-        y_hb, hb_sr = librosa.load(picked_audio, sr=None, mono=True)
         
         logger.info(f"[mix] Extracting continuous stable 3s segment (Zero-Crossing + Boundary Check)...")
         s, e = extract_continuous_stable_3s(y_hb, hb_sr)
