@@ -9,6 +9,8 @@ from pydub import AudioSegment
 import numpy as np
 from scipy import signal
 import scipy.signal
+from scipy.signal import oaconvolve
+import gc
 import soundfile as sf
 import logging
 import traceback
@@ -121,8 +123,8 @@ def extract_continuous_stable_3s(y: np.ndarray, sr: int):
     orig_start, orig_end, _ = find_best_window(y, sr)
     # === FIND ALL VALLEYS + COST MINIMIZATION CHO S VA E ===
     env_smooth = int(0.05 * sr)
-    full_env = np.sqrt(np.convolve(y**2, np.ones(env_smooth)/env_smooth, mode='same'))
-    med_rms = np.median(full_env)
+    full_env = np.sqrt(oaconvolve(y**2, np.ones(env_smooth, dtype=np.float32) / env_smooth, mode='same')).astype(np.float32)
+    med_rms = float(np.median(full_env))
     
     # Bo distance de khong bo sot cac valley cuc bo
     valleys, _ = scipy.signal.find_peaks(-full_env)
@@ -154,6 +156,9 @@ def extract_continuous_stable_3s(y: np.ndarray, sr: int):
     # Tim e (quet tu s + 1.5s den s + 4.5s de nam trong khoang 3s, uu tien vung gan orig_end)
     e = find_best_valley(orig_end, s + int(1.5 * sr), min(len(y) - 1, s + int(4.5 * sr)))
 
+    del full_env
+    gc.collect()
+
     # Gioi han min_duration neu file qua ngan
     min_duration = int(1.9 * sr)
     min_duration = min(min_duration, len(y) - s - int(0.1*sr))
@@ -181,11 +186,11 @@ def create_seamless_loop(y: np.ndarray, sr: int, s: int, e: int, target_duration
     1. Dung Cross-Correlation de tim chu ky (cycle length L) tron xoe nhat (tranh vấp nhip).
     2. Chi ap dung crossfade rat ngan (80ms) o diem cat L de khong bi chong cheo dai gay giam am luong (phasing/volume dip).
     """
-    y_cut = y[s:e].copy()
+    y_cut = y[s:e]
     
     # 1. Tinh Envelope de so khop nhip
     smooth_win = int(0.04 * sr)
-    env = np.sqrt(np.convolve(y_cut**2, np.ones(smooth_win) / smooth_win, mode='same'))
+    env = np.sqrt(oaconvolve(y_cut.astype(np.float32)**2, np.ones(smooth_win, dtype=np.float32) / smooth_win, mode='same')).astype(np.float32)
     
     # 2. Tim chu ky hoan hao bang Cross-Correlation
     min_overlap = int(0.1 * sr)
@@ -208,6 +213,9 @@ def create_seamless_loop(y: np.ndarray, sr: int, s: int, e: int, target_duration
                 best_score = score
                 best_O = O
                 
+    del env
+    gc.collect()
+    
     # Fallback neu khong tim thay su tuong quan tot (< 0.4)
     if best_score > 0.4:
         L_samples = len(y_cut) - best_O
@@ -226,17 +234,18 @@ def create_seamless_loop(y: np.ndarray, sr: int, s: int, e: int, target_duration
     if loop_times < 1: loop_times = 1
     
     out_len = L_samples * loop_times + fade_len
-    output = np.zeros(out_len, dtype=np.float64)
+    output = np.zeros(out_len, dtype=np.float32)
     
     # Dung Equal Power crossfade vi doan noi chi co 80ms
-    t = np.linspace(0, 1, fade_len, dtype=np.float64)
+    t = np.linspace(0, 1, fade_len, dtype=np.float32)
     fade_in = np.sqrt(t)
     fade_out = np.sqrt(1.0 - t)
     
+    seg_base = y_cut[:L_samples + fade_len].astype(np.float32)
+    
     for i in range(loop_times):
         pos = i * L_samples
-        # Chi lay 1 chu ky (L_samples) cong them phan duoi (fade_len) de crossfade
-        seg_win = y_cut[:L_samples + fade_len].astype(np.float64).copy()
+        seg_win = seg_base.copy()
         
         if i > 0:
             seg_win[:fade_len] *= fade_in
@@ -244,6 +253,9 @@ def create_seamless_loop(y: np.ndarray, sr: int, s: int, e: int, target_duration
             seg_win[-fade_len:] *= fade_out
             
         output[pos : pos + len(seg_win)] += seg_win
+        
+    del seg_base, fade_in, fade_out, t
+    gc.collect()
         
     # Cat dung do dai target
     target_samples_out = int(target_duration * sr)
@@ -1845,6 +1857,9 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         else:
             logger.info(f"[mix] AI Action (EQ): Track is DARK. NO Low-Pass Filter applied.")
 
+        del track_raw
+        gc.collect()
+
         # Load heartbeat for BPM Sync & Mix
         logger.info(f"[mix] Loading heartbeat: {picked_audio}")
         y_hb, hb_sr = librosa.load(picked_audio, sr=None, mono=True)
@@ -1885,7 +1900,11 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
                     logger.info(f'[mix] AI Action (BPM Sync): Forced sync without octave limits. Time-stretching track by {clamped_rate:.3f}.')
                     # Chạy tuần tự để tiết kiệm RAM, tránh OOM/Crash trên production server (đánh đổi chút CPU time)
                     stretched_channels = [librosa.effects.time_stretch(track_norm[i], rate=clamped_rate) for i in range(n_ch)]
+                    del track_norm
+                    gc.collect()
                     track_norm = np.stack(stretched_channels, axis=0)
+                    del stretched_channels
+                    gc.collect()
                     track_samples = track_norm.shape[1]
                 else:
                     logger.info(f'[mix] AI Action (BPM Sync): Rate is ~1.0, no stretch applied.')
@@ -1899,6 +1918,8 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         
         track_padded = np.zeros((n_ch, total_samples), dtype=np.float32)
         track_padded[:, fade_n : fade_n + track_samples] = track_norm
+        del track_norm
+        gc.collect()
         
         logger.info(f"[mix] Extracting continuous stable 3s segment (Zero-Crossing + Boundary Check)...")
         s, e = extract_continuous_stable_3s(y_hb, hb_sr)
@@ -1916,13 +1937,21 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
             pad_len = total_samples - len(hb_loop_raw)
             hb_loop_raw = np.pad(hb_loop_raw, (0, pad_len), mode='constant')
             
-        # AI Logic: Auto-Adaptive Heartbeat Volume based on Crest Factor
-        # Dense track (Crest=11) -> -6dB. Sparse track (Crest=17) -> -12dB
-        dynamic_hb_offset = -6.0 - (crest_factor - 11.0)
-        dynamic_hb_offset = np.clip(dynamic_hb_offset, -14.0, -5.0)
+        # V3 AI Logic: Phân tích Peak/RMS cho tiếng tim
+        hb_rms = np.sqrt(np.mean(hb_loop_raw**2) + 1e-9)
+        hb_peak = np.max(np.abs(hb_loop_raw))
+        hb_crest_factor = 20 * np.log10(hb_peak + 1e-9) - 20 * np.log10(hb_rms)
+
+        # AI Logic: Bù trừ kép (Dual Crest-Factor Compensation)
+        dynamic_hb_offset = -13.0 - (crest_factor - 11.0) + (hb_crest_factor - 14.5)
+        dynamic_hb_offset = float(np.clip(dynamic_hb_offset, -30.0, -10.0))
+
         heartbeat_target_rms = target_track_rms + dynamic_hb_offset
         seg_norm = normalize_rms(hb_loop_raw, heartbeat_target_rms)
-        logger.info(f"[mix] Heartbeat synced at {heartbeat_target_rms:.2f} dBFS (Offset: {dynamic_hb_offset:.1f}dB, Crest: {crest_factor:.1f}dB).")
+        del hb_loop_raw
+        gc.collect()
+        
+        logger.info(f"[mix] Heartbeat synced at {heartbeat_target_rms:.2f} dBFS (Offset: {dynamic_hb_offset:.1f}dB, TrackCrest: {crest_factor:.1f}dB, HBCrest: {hb_crest_factor:.1f}dB).")
         
         seg_stereo = np.stack([seg_norm] * n_ch, axis=0).astype(np.float32)
         
@@ -1934,46 +1963,20 @@ def mix_audio_v1(asset_audio, picked_audio, output_path, original_bpm=120, targe
         stable_env[-env_fade_n:] = np.linspace(1.0, 0.0, env_fade_n)
         
         seg_mix = seg_stereo * stable_env[np.newaxis, :]
+        del seg_stereo, stable_env
+        gc.collect()
 
-        logger.info(f"[mix] FINAL MIXING & PEAK PROTECTION (WITH SIDECHAIN DUCKING)...")
+        logger.info(f"[mix] FINAL MIXING & PEAK PROTECTION...")
         
-        # 1. Extract Heartbeat Envelope
-        smooth_win = int(0.05 * track_sr)
-        hb_power = scipy.signal.fftconvolve(seg_norm**2, np.ones(smooth_win)/smooth_win, mode='same')
-        hb_power = np.maximum(hb_power, 0)
-        hb_env = np.sqrt(hb_power)
-        
-        env_max = np.max(hb_env)
-        if env_max > 1e-6:
-            hb_env = hb_env / env_max
-        else:
-            hb_env = np.zeros_like(hb_env)
-            
-        # 2. Create Ducking Curve (Dynamic based on Crest Factor)
-        dynamic_duck_db = 4.0 - (crest_factor - 11.0) * 0.5
-        dynamic_duck_db = np.clip(dynamic_duck_db, 0.0, 5.0)
-        logger.info(f"[mix] Sidechain Ducking applied: {dynamic_duck_db:.1f} dB reduction.")
-        
-        if dynamic_duck_db > 0.1:
-            duck_amount = 1.0 - (10 ** (-dynamic_duck_db / 20.0))
-            duck_curve = 1.0 - (hb_env * duck_amount)
-            
-            # 3. Smooth Release for natural sound
-            release_win = int(0.15 * track_sr)
-            duck_curve_release = scipy.signal.fftconvolve(duck_curve - 1.0, np.ones(release_win)/release_win, mode='same') + 1.0
-            duck_curve = np.clip(duck_curve_release, 0.1, 1.0)
-            
-            # Apply ducking to the track
-            track_ducked = track_padded * duck_curve[np.newaxis, :]
-        else:
-            # No ducking for very sparse tracks
-            track_ducked = track_padded
-        
-        # Mix
-        mix_out = seg_mix + track_ducked
+        # Mix (in-place cộng vào seg_mix)
+        seg_mix += track_padded
+        del track_padded
+        gc.collect()
         
         # Master Peak Limiter
-        final_out = smart_peak_limiter(mix_out, ceiling_db=-0.1)
+        final_out = smart_peak_limiter(seg_mix, ceiling_db=-0.1)
+        del seg_mix
+        gc.collect()
 
         temp_wav_out = os.path.join(temp_dir, 'final_mix.wav')
         sf.write(temp_wav_out, final_out.T, track_sr, subtype='PCM_16')
